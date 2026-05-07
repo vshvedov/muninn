@@ -1,0 +1,934 @@
+"""Workflow-level tests with stubbed agent + Markdown widget."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+from pydantic_ai.settings import ModelSettings
+
+from muninn.workflows import (
+    BugRunCtx,
+    FeatureRunCtx,
+    ReviewRunCtx,
+    _has_no_findings,
+    _python_syntax_check,
+    _verdict,
+    bug_flow,
+    feature_flow,
+    precommit_review_flow,
+)
+
+
+def _label(opt) -> str:
+    """Options may be plain strings or (label, explanation) tuples; return
+    the label either way."""
+    return opt[0] if isinstance(opt, tuple) else opt
+
+
+async def _ask_user_stub(_question: str, options) -> str:
+    """Default ask_user used by tests that don't exercise the unconverged path."""
+    return _label(options[0]) if options else "ok"
+
+
+def _pick(options, prefix: str) -> str:
+    """Pick the first option whose label starts with prefix; returns the label."""
+    return next(_label(o) for o in options if _label(o).startswith(prefix))
+
+
+def test_verdict_parses_design_ready() -> None:
+    assert _verdict("...some critique...\n\ndesign ready") == "ready"
+    assert _verdict("DESIGN READY\n") == "ready"
+    assert _verdict("design ready.") == "ready"
+
+
+def test_verdict_parses_needs_revision() -> None:
+    assert _verdict("1. gap\n\ndesign needs revision") == "revise"
+    assert _verdict("Design Needs Revision") == "revise"
+
+
+def test_verdict_unknown() -> None:
+    assert _verdict("some unrelated trailing line") == "unknown"
+
+
+# --- feature_flow integration with stub agents ----------------------------
+
+
+class _FakeMd:
+    """Stand-in for Textual Markdown - captures stream writes."""
+
+    def __init__(self) -> None:
+        self.buf: list[str] = []
+
+    # Streaming.run_and_stream calls Markdown.get_stream(self) - we patch that.
+    pass
+
+
+class _FakeStream:
+    def __init__(self, md: _FakeMd) -> None:
+        self.md = md
+
+    async def write(self, fragment: str) -> None:
+        self.md.buf.append(fragment)
+
+    async def stop(self) -> None:
+        pass
+
+
+@dataclass
+class _FakeAgent:
+    name: str
+    output_text: str
+
+    async def run_stream_events(self, prompt, *, message_history=None, model_settings=None):
+        # Yield a few text deltas + a final result event.
+        from pydantic_ai.messages import (
+            PartDeltaEvent,
+            TextPartDelta,
+        )
+        from pydantic_ai.run import AgentRunResultEvent
+
+        for chunk in [self.output_text[i:i+20] for i in range(0, len(self.output_text), 20)]:
+            yield PartDeltaEvent(index=0, delta=TextPartDelta(content_delta=chunk))
+
+        # Build a minimal result-like object.
+        class _R:
+            def __init__(self, text):
+                self.output = text
+            def new_messages(self):
+                return []
+
+        yield AgentRunResultEvent(result=_R(self.output_text))
+
+
+async def test_feature_flow_happy_path(monkeypatch) -> None:
+    from textual.widgets import Markdown
+    from muninn.streaming import run_and_stream
+    from muninn import streaming as streaming_mod
+
+    # Replace Markdown.get_stream with our fake.
+    monkeypatch.setattr(Markdown, "get_stream",
+                        classmethod(lambda cls, md: _FakeStream(md)))
+
+    pane_log: list[tuple[str, str]] = []
+
+    async def mount_muninn(header: str):
+        pane_log.append(("muninn", header))
+        return _FakeMd()
+
+    async def mount_huginn(header: str):
+        pane_log.append(("huginn", header))
+        return _FakeMd()
+
+    log_records: list[dict] = []
+
+    muninn = _FakeAgent("muninn", "DESIGN DOC ... here is the design.")
+    huginn_count = [0]
+
+    def huginn_factory():
+        huginn_count[0] += 1
+        return _FakeAgent("huginn", "no gaps. design ready")
+
+    ctx = FeatureRunCtx(
+        description="dummy feature",
+        muninn_agent=muninn,
+        huginn_agent_factory=huginn_factory,
+        muninn_history=[],
+        feature_ground_prompt="ground: {description}",
+        feature_design_prompt="design: {description}",
+        feature_critique_prompt="critique: {design_doc}",
+        model_settings=ModelSettings(),
+        log=log_records.append,
+        mount_muninn_md=mount_muninn,
+        mount_huginn_md=mount_huginn,
+        ask_user=_ask_user_stub,
+    )
+    summary = await feature_flow(ctx)
+    assert summary["type"] == "feature_complete"
+    # Muninn pane mounts: kickoff banner + ground + design + implement + final = 5
+    assert sum(1 for p, _ in pane_log if p == "muninn") == 5
+    # Huginn pane mounts: streaming widget + verdict callout = 2
+    assert sum(1 for p, _ in pane_log if p == "huginn") == 2
+    assert huginn_count[0] == 1
+    # Grounding step ran and was logged.
+    assert any(r.get("type") == "muninn_grounded" for r in log_records)
+    # Verdict was logged.
+    assert any(r.get("type") == "huginn_verdict" and r.get("verdict") == "ready"
+               for r in log_records)
+
+
+async def test_feature_flow_one_revision_round(monkeypatch) -> None:
+    from textual.widgets import Markdown
+    monkeypatch.setattr(Markdown, "get_stream",
+                        classmethod(lambda cls, md: _FakeStream(md)))
+
+    async def mount_md(_h):
+        return _FakeMd()
+
+    log_records: list[dict] = []
+    muninn = _FakeAgent("muninn", "design doc v1")
+    huginn_outputs = ["gap 1.\ndesign needs revision", "ok now.\ndesign ready"]
+    idx = [0]
+
+    def huginn_factory():
+        out = huginn_outputs[idx[0]] if idx[0] < len(huginn_outputs) else "design ready"
+        idx[0] += 1
+        return _FakeAgent("huginn", out)
+
+    ctx = FeatureRunCtx(
+        description="dummy",
+        muninn_agent=muninn,
+        huginn_agent_factory=huginn_factory,
+        muninn_history=[],
+        feature_ground_prompt="ground: {description}",
+        feature_design_prompt="design: {description}",
+        feature_critique_prompt="critique: {design_doc}",
+        model_settings=ModelSettings(),
+        log=log_records.append,
+        mount_muninn_md=mount_md,
+        mount_huginn_md=mount_md,
+        ask_user=_ask_user_stub,
+    )
+    summary = await feature_flow(ctx)
+    assert summary["type"] == "feature_complete"
+    # Two huginn rounds because the first verdict was "revise".
+    assert idx[0] == 2
+    verdicts = [r for r in log_records if r.get("type") == "huginn_verdict"]
+    assert len(verdicts) == 2
+    assert verdicts[0]["verdict"] == "revise"
+    assert verdicts[1]["verdict"] == "ready"
+
+
+def _make_unconverged_ctx(ask_user_fn, log_records):
+    """Helper: ctx where Huginn always says 'design needs revision' so the
+    backstop fires."""
+    async def mount_md(_h): return _FakeMd()
+    muninn = _FakeAgent("muninn", "design")
+    huginn_factory = lambda: _FakeAgent("huginn", "still bad. design needs revision")
+    return FeatureRunCtx(
+        description="dummy", muninn_agent=muninn, huginn_agent_factory=huginn_factory,
+        muninn_history=[], feature_ground_prompt="g: {description}",
+        feature_design_prompt="d: {description}", feature_critique_prompt="c: {design_doc}",
+        model_settings=ModelSettings(), log=log_records.append,
+        mount_muninn_md=mount_md, mount_huginn_md=mount_md, ask_user=ask_user_fn,
+    )
+
+
+async def test_feature_flow_honors_ctx_max_revision_rounds(monkeypatch) -> None:
+    """ctx.max_revision_rounds=1 caps the loop at 2 huginn verdicts then prompts."""
+    from textual.widgets import Markdown
+    monkeypatch.setattr(Markdown, "get_stream",
+                        classmethod(lambda cls, md: _FakeStream(md)))
+    log_records: list[dict] = []
+
+    async def ask_proceed(_q, opts):
+        return _pick(opts, "proceed")
+
+    ctx = _make_unconverged_ctx(ask_proceed, log_records)
+    ctx.max_revision_rounds = 1
+    summary = await feature_flow(ctx)
+    verdicts = [r for r in log_records if r.get("type") == "huginn_verdict"]
+    # max_rounds=1 -> initial cold-read + 1 revision round = 2 verdicts.
+    assert len(verdicts) == 2
+    assert summary["type"] == "feature_complete"
+
+
+async def test_feature_flow_unconverged_user_proceeds(monkeypatch) -> None:
+    """Huginn never converges; backstop asks user; user picks proceed -> implements anyway."""
+    from textual.widgets import Markdown
+    from muninn.workflows import MAX_REVISION_ROUNDS
+    monkeypatch.setattr(Markdown, "get_stream",
+                        classmethod(lambda cls, md: _FakeStream(md)))
+
+    log_records: list[dict] = []
+
+    async def ask_proceed(_q, opts):
+        return _pick(opts, "proceed")
+
+    ctx = _make_unconverged_ctx(ask_proceed, log_records)
+    summary = await feature_flow(ctx)
+    assert summary["type"] == "feature_complete"
+    verdicts = [r for r in log_records if r.get("type") == "huginn_verdict"]
+    assert len(verdicts) == MAX_REVISION_ROUNDS + 1
+    assert all(v["verdict"] == "revise" for v in verdicts)
+    assert any(r.get("type") == "feature_unconverged" for r in log_records)
+
+
+async def test_feature_flow_unconverged_user_cancels(monkeypatch) -> None:
+    from textual.widgets import Markdown
+    monkeypatch.setattr(Markdown, "get_stream",
+                        classmethod(lambda cls, md: _FakeStream(md)))
+    log_records: list[dict] = []
+
+    async def ask_cancel(_q, opts):
+        return _pick(opts, "cancel")
+
+    ctx = _make_unconverged_ctx(ask_cancel, log_records)
+    summary = await feature_flow(ctx)
+    assert summary["type"] == "feature_cancelled"
+    assert summary["implement_len"] == 0
+
+
+async def test_feature_flow_unconverged_one_more_round_then_proceed(monkeypatch) -> None:
+    """User asks for one extra round, still not converged, then proceeds."""
+    from textual.widgets import Markdown
+    from muninn.workflows import MAX_REVISION_ROUNDS
+    monkeypatch.setattr(Markdown, "get_stream",
+                        classmethod(lambda cls, md: _FakeStream(md)))
+    log_records: list[dict] = []
+    call = [0]
+
+    async def ask_choices(_q, opts):
+        call[0] += 1
+        if call[0] == 1:
+            return _pick(opts, "do one more")
+        return _pick(opts, "proceed")
+
+    ctx = _make_unconverged_ctx(ask_choices, log_records)
+    summary = await feature_flow(ctx)
+    assert summary["type"] == "feature_complete"
+    verdicts = [r for r in log_records if r.get("type") == "huginn_verdict"]
+    # Initial MAX+1 critiques + 1 extra round = MAX+2.
+    assert len(verdicts) == MAX_REVISION_ROUNDS + 2
+
+
+async def test_feature_flow_unconverged_user_answers_directly(monkeypatch) -> None:
+    """User picks 'let me answer' -> Muninn runs the resolve step -> proceeds."""
+    from textual.widgets import Markdown
+    monkeypatch.setattr(Markdown, "get_stream",
+                        classmethod(lambda cls, md: _FakeStream(md)))
+    log_records: list[dict] = []
+
+    async def ask_resolve(_q, opts):
+        return _pick(opts, "let me answer")
+
+    ctx = _make_unconverged_ctx(ask_resolve, log_records)
+    summary = await feature_flow(ctx)
+    assert summary["type"] == "feature_complete"
+    assert any(r.get("type") == "muninn_user_resolved" for r in log_records)
+
+
+# --- three-goldfish design check (article-faithful flow) ------------------
+#
+# The legacy /feature tests above leave feature_comprehension_prompt and
+# feature_readiness_prompt at "" so they hit the critic-only fallback.
+# These tests pass concrete prompts and exercise the full
+# comprehension + critic + readiness loop the article prescribes.
+
+
+def _make_seq_huginn_factory(outputs: list[str]):
+    """Pop one canned output per call so a test can describe a multi-pass
+    round as an ordered list. Useful when the test cares about the exact
+    ordering of comprehension / critic / readiness across rounds.
+    """
+    idx = [0]
+
+    def factory():
+        out = outputs[idx[0]] if idx[0] < len(outputs) else outputs[-1]
+        idx[0] += 1
+        return _FakeAgent("huginn", out)
+
+    return factory, idx
+
+
+def _make_three_pass_ctx(huginn_factory, log_records, *, max_rounds: int | None = None):
+    async def mount_md(_h):
+        return _FakeMd()
+
+    muninn = _FakeAgent("muninn", "design doc body")
+    ctx = FeatureRunCtx(
+        description="dummy",
+        muninn_agent=muninn,
+        huginn_agent_factory=huginn_factory,
+        muninn_history=[],
+        feature_ground_prompt="g: {description}",
+        feature_design_prompt="d: {description}",
+        feature_critique_prompt="critique: {design_doc}",
+        feature_comprehension_prompt="comprehension: {design_doc}",
+        feature_readiness_prompt="readiness: {design_doc}",
+        model_settings=ModelSettings(),
+        log=log_records.append,
+        mount_muninn_md=mount_md,
+        mount_huginn_md=mount_md,
+        ask_user=_ask_user_stub,
+    )
+    if max_rounds is not None:
+        ctx.max_revision_rounds = max_rounds
+    return ctx
+
+
+async def test_three_pass_happy_path(monkeypatch) -> None:
+    """All three passes return ready on round 1; no revisions; 3 huginn calls."""
+    from textual.widgets import Markdown
+    monkeypatch.setattr(Markdown, "get_stream",
+                        classmethod(lambda cls, md: _FakeStream(md)))
+    log_records: list[dict] = []
+    huginn_factory, idx = _make_seq_huginn_factory([
+        "doc paraphrase.\ncomprehension passed",
+        "no gaps.\ndesign ready",
+        "no questions.\nimplementation ready",
+    ])
+    ctx = _make_three_pass_ctx(huginn_factory, log_records)
+    summary = await feature_flow(ctx)
+    assert summary["type"] == "feature_complete"
+    # One round = 3 huginn calls (comprehension + critic + readiness).
+    assert idx[0] == 3
+    # Per-pass verdicts are logged distinctly.
+    verdicts = [r for r in log_records if r.get("type") == "huginn_verdict"]
+    assert len(verdicts) == 3
+    kinds = [v.get("kind") for v in verdicts]
+    assert kinds == ["comprehension", "critic", "readiness"]
+    assert all(v["verdict"] == "ready" for v in verdicts)
+    # The combined-round summary records "ready".
+    rounds = [r for r in log_records if r.get("type") == "design_check_round"]
+    assert len(rounds) == 1
+    assert rounds[0]["combined"] == "ready"
+
+
+async def test_three_pass_readiness_blocks_critic_pass(monkeypatch) -> None:
+    """Critic ready but readiness not ready -> revise. Round 2 runs only
+    critic + readiness (no comprehension) and converges."""
+    from textual.widgets import Markdown
+    monkeypatch.setattr(Markdown, "get_stream",
+                        classmethod(lambda cls, md: _FakeStream(md)))
+    log_records: list[dict] = []
+    huginn_factory, idx = _make_seq_huginn_factory([
+        # Round 1: comprehension passes, critic ready, readiness blocks.
+        "paraphrase.\ncomprehension passed",
+        "no gaps.\ndesign ready",
+        "1. how do we handle Ollama down?\nimplementation not ready",
+        # Round 2: critic ready, readiness ready (no comprehension call).
+        "still no gaps.\ndesign ready",
+        "no questions.\nimplementation ready",
+    ])
+    ctx = _make_three_pass_ctx(huginn_factory, log_records)
+    summary = await feature_flow(ctx)
+    assert summary["type"] == "feature_complete"
+    # Round 1 = 3 calls, round 2 = 2 calls (no comprehension) -> 5 total.
+    assert idx[0] == 5
+    # Round summaries: round 1 not ready, round 2 ready.
+    rounds = [r for r in log_records if r.get("type") == "design_check_round"]
+    assert [r["combined"] for r in rounds] == ["revise", "ready"]
+    assert rounds[0]["readiness"] == "revise"
+    assert rounds[0]["critic"] == "ready"
+    # Round 2 logs comprehension as "skipped" because we don't re-run it.
+    assert rounds[1]["comprehension"] == "skipped"
+    # Muninn was asked to revise once.
+    assert sum(1 for r in log_records if r.get("type") == "muninn_design_revised") == 1
+
+
+async def test_three_pass_comprehension_unclear_does_not_block(monkeypatch) -> None:
+    """Comprehension flagged as unclear is informational - if critic and
+    readiness both pass, the round is ready and we go straight to implement.
+    The unclear paraphrase is still logged."""
+    from textual.widgets import Markdown
+    monkeypatch.setattr(Markdown, "get_stream",
+                        classmethod(lambda cls, md: _FakeStream(md)))
+    log_records: list[dict] = []
+    huginn_factory, idx = _make_seq_huginn_factory([
+        "section X is too vague.\ncomprehension unclear",
+        "no gaps.\ndesign ready",
+        "no questions.\nimplementation ready",
+    ])
+    ctx = _make_three_pass_ctx(huginn_factory, log_records)
+    summary = await feature_flow(ctx)
+    assert summary["type"] == "feature_complete"
+    assert idx[0] == 3
+    rounds = [r for r in log_records if r.get("type") == "design_check_round"]
+    assert rounds[0]["combined"] == "ready"
+    assert rounds[0]["comprehension"] == "revise"
+    # No revision happened because the combined verdict was ready.
+    assert not any(r.get("type") == "muninn_design_revised" for r in log_records)
+
+
+async def test_three_pass_revise_bundle_has_both_sections() -> None:
+    """The bundle fed to the revise prompt labels critic and readiness
+    sections separately so the model can address both."""
+    from muninn.workflows import _combined_critique
+    bundle = _combined_critique(
+        comprehension_text="",
+        critic_text="1. interface vague.\ndesign needs revision",
+        readiness_text="1. file path missing.\nimplementation not ready",
+    )
+    assert "=== CRITIC GAPS ===" in bundle
+    assert "=== READINESS OPEN QUESTIONS ===" in bundle
+    assert "=== COMPREHENSION FEEDBACK" not in bundle  # empty -> omitted
+
+    bundle_with_compr = _combined_critique(
+        comprehension_text="section X reads ambiguously.\ncomprehension unclear",
+        critic_text="1. gap",
+        readiness_text="1. q",
+    )
+    assert "=== COMPREHENSION FEEDBACK" in bundle_with_compr
+
+
+async def test_verdict_accepts_custom_tokens() -> None:
+    """The generalized parser handles the new comprehension and readiness
+    closing strings via explicit tokens."""
+    assert _verdict(
+        "doc paraphrase\ncomprehension passed",
+        ready_token="comprehension passed",
+        revise_token="comprehension unclear",
+    ) == "ready"
+    assert _verdict(
+        "section X unclear\ncomprehension unclear",
+        ready_token="comprehension passed",
+        revise_token="comprehension unclear",
+    ) == "revise"
+    assert _verdict(
+        "open question\nimplementation not ready",
+        ready_token="implementation ready",
+        revise_token="implementation not ready",
+    ) == "revise"
+
+
+# --- /bug tests ----------------------------------------------------------
+
+
+def _make_bug_ctx(
+    *,
+    muninn_output: str,
+    huginn_outputs: list[str],
+    ask_user_fn,
+    log_records: list[dict],
+):
+    """Helper: build a BugRunCtx wired to fake agents that emit canned text."""
+    async def mount_md(_h):
+        return _FakeMd()
+
+    muninn = _FakeAgent("muninn", muninn_output)
+    idx = [0]
+
+    def huginn_factory():
+        out = (huginn_outputs[idx[0]]
+               if idx[0] < len(huginn_outputs)
+               else "design ready")
+        idx[0] += 1
+        return _FakeAgent("huginn", out)
+
+    return BugRunCtx(
+        description="dummy bug",
+        muninn_agent=muninn,
+        huginn_agent_factory=huginn_factory,
+        muninn_history=[],
+        bug_ground_prompt="ground: {description}",
+        bug_problem_prompt="problem: {description}",
+        bug_critique_prompt="critique: {problem_doc}",
+        model_settings=ModelSettings(),
+        log=log_records.append,
+        mount_muninn_md=mount_md,
+        mount_huginn_md=mount_md,
+        ask_user=ask_user_fn,
+    )
+
+
+async def test_bug_flow_happy_path(monkeypatch) -> None:
+    """Huginn signs off on round 1; flow runs problem doc + test + fix."""
+    from textual.widgets import Markdown
+    monkeypatch.setattr(Markdown, "get_stream",
+                        classmethod(lambda cls, md: _FakeStream(md)))
+    log_records: list[dict] = []
+    ctx = _make_bug_ctx(
+        muninn_output="problem doc",
+        huginn_outputs=["clean.\ndesign ready"],
+        ask_user_fn=_ask_user_stub,
+        log_records=log_records,
+    )
+    summary = await bug_flow(ctx)
+    assert summary["type"] == "bug_complete"
+    # Step 1 (ground) + step 2 (problem) + step 4 (test) + step 5 (fix) =
+    # 4 muninn agent calls. Plus the ground log.
+    muninn_grounded = [r for r in log_records if r.get("type") == "muninn_grounded"]
+    assert len(muninn_grounded) == 1
+    test_writes = [r for r in log_records if r.get("type") == "muninn_bug_test_written"]
+    assert len(test_writes) == 1
+
+
+async def test_bug_flow_one_revision_round(monkeypatch) -> None:
+    """Round 1 says revise, round 2 says ready, then test + fix proceed."""
+    from textual.widgets import Markdown
+    monkeypatch.setattr(Markdown, "get_stream",
+                        classmethod(lambda cls, md: _FakeStream(md)))
+    log_records: list[dict] = []
+    ctx = _make_bug_ctx(
+        muninn_output="problem doc",
+        huginn_outputs=[
+            "1. gap.\ndesign needs revision",
+            "ok.\ndesign ready",
+        ],
+        ask_user_fn=_ask_user_stub,
+        log_records=log_records,
+    )
+    summary = await bug_flow(ctx)
+    assert summary["type"] == "bug_complete"
+    verdicts = [r for r in log_records if r.get("type") == "huginn_verdict"]
+    assert len(verdicts) == 2
+    assert verdicts[0]["verdict"] == "revise"
+    assert verdicts[1]["verdict"] == "ready"
+    # Revision log entry exists.
+    assert any(r.get("type") == "muninn_bug_problem_revised" for r in log_records)
+
+
+async def test_bug_flow_user_cancels_at_backstop(monkeypatch) -> None:
+    """Huginn never converges; user picks cancel at the backstop."""
+    from textual.widgets import Markdown
+    monkeypatch.setattr(Markdown, "get_stream",
+                        classmethod(lambda cls, md: _FakeStream(md)))
+    log_records: list[dict] = []
+
+    async def ask_cancel(_q, opts):
+        return _pick(opts, "cancel")
+
+    ctx = _make_bug_ctx(
+        muninn_output="problem doc",
+        huginn_outputs=["bad.\ndesign needs revision"] * 10,
+        ask_user_fn=ask_cancel,
+        log_records=log_records,
+    )
+    summary = await bug_flow(ctx)
+    assert summary["type"] == "bug_cancelled"
+    assert summary["test_len"] == 0
+    assert summary["fix_len"] == 0
+
+
+async def test_bug_flow_user_resolves_directly(monkeypatch) -> None:
+    """Huginn keeps flagging; user picks 'let me answer the remaining gaps'."""
+    from textual.widgets import Markdown
+    monkeypatch.setattr(Markdown, "get_stream",
+                        classmethod(lambda cls, md: _FakeStream(md)))
+    log_records: list[dict] = []
+
+    async def ask_resolve(_q, opts):
+        return _pick(opts, "let me answer")
+
+    ctx = _make_bug_ctx(
+        muninn_output="problem doc",
+        huginn_outputs=["bad.\ndesign needs revision"] * 10,
+        ask_user_fn=ask_resolve,
+        log_records=log_records,
+    )
+    summary = await bug_flow(ctx)
+    assert summary["type"] == "bug_complete"
+    assert any(r.get("type") == "muninn_bug_user_resolved" for r in log_records)
+
+
+# --- /precommit-review tests ----------------------------------------------
+
+
+def test_has_no_findings_parser() -> None:
+    assert _has_no_findings("1. foo\n\nno findings") is True
+    assert _has_no_findings("1. foo\nfindings flagged") is False
+    assert _has_no_findings("rambling output without verdict") is False
+    assert _has_no_findings("") is False
+
+
+def test_python_syntax_check_skips_when_no_py_files(tmp_path) -> None:
+    (tmp_path / "README.md").write_text("# hi\n")
+    res = _python_syntax_check(tmp_path, ["README.md"])
+    assert res["status"] == "skip"
+    assert "no python files" in res["summary"]
+
+
+def test_python_syntax_check_passes_clean_file(tmp_path) -> None:
+    (tmp_path / "good.py").write_text("x = 1\n")
+    res = _python_syntax_check(tmp_path, ["good.py"])
+    assert res["status"] == "pass"
+
+
+def test_python_syntax_check_reports_failures(tmp_path) -> None:
+    (tmp_path / "bad.py").write_text("def f(:\n  pass\n")
+    (tmp_path / "good.py").write_text("y = 2\n")
+    res = _python_syntax_check(tmp_path, ["bad.py", "good.py"])
+    assert res["status"] == "fail"
+    assert "bad.py" in res["summary"]
+
+
+def test_python_syntax_check_skips_files_that_disappeared(tmp_path) -> None:
+    """git diff may list a renamed/deleted file - we only check what exists."""
+    res = _python_syntax_check(tmp_path, ["nonexistent.py"])
+    assert res["status"] == "skip"
+
+
+def _git_init_with_pending_change(tmp_path) -> None:
+    """Create a tmp git repo with one committed file and one pending edit."""
+    import subprocess
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=tmp_path, check=True)
+    f = tmp_path / "thing.py"
+    f.write_text("x = 1\n")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=tmp_path, check=True)
+    f.write_text("x = 1\ny = 2\n")  # pending change
+
+
+async def test_review_flow_skips_when_no_pending_changes(tmp_path, monkeypatch) -> None:
+    import subprocess
+    from textual.widgets import Markdown
+    monkeypatch.setattr(Markdown, "get_stream",
+                        classmethod(lambda cls, md: _FakeStream(md)))
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=tmp_path, check=True)
+    f = tmp_path / "thing.py"
+    f.write_text("x = 1\n")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=tmp_path, check=True)
+
+    async def mount_md(_h): return _FakeMd()
+    log_records: list[dict] = []
+
+    ctx = ReviewRunCtx(
+        cwd=tmp_path,
+        huginn_agent_factory=lambda: _FakeAgent("h", "no findings"),
+        review_prompt="checks={checks}\ndiff={diff}",
+        model_settings=ModelSettings(),
+        log=log_records.append,
+        mount_muninn_md=mount_md,
+        mount_huginn_md=mount_md,
+    )
+    summary = await precommit_review_flow(ctx)
+    assert summary["type"] == "review_skipped"
+
+
+async def test_review_flow_aborts_when_not_a_git_repo(tmp_path, monkeypatch) -> None:
+    from textual.widgets import Markdown
+    monkeypatch.setattr(Markdown, "get_stream",
+                        classmethod(lambda cls, md: _FakeStream(md)))
+
+    async def mount_md(_h): return _FakeMd()
+    log_records: list[dict] = []
+
+    ctx = ReviewRunCtx(
+        cwd=tmp_path,
+        huginn_agent_factory=lambda: _FakeAgent("h", "no findings"),
+        review_prompt="checks={checks}\ndiff={diff}",
+        model_settings=ModelSettings(),
+        log=log_records.append,
+        mount_muninn_md=mount_md,
+        mount_huginn_md=mount_md,
+    )
+    summary = await precommit_review_flow(ctx)
+    assert summary["type"] == "review_aborted"
+    assert "git" in summary["reason"]
+
+
+async def test_review_flow_logs_detected_stack(tmp_path, monkeypatch) -> None:
+    """A repo with Cargo.toml is detected as 'rust' even with no .rs in diff."""
+    import subprocess
+    from textual.widgets import Markdown
+    monkeypatch.setattr(Markdown, "get_stream",
+                        classmethod(lambda cls, md: _FakeStream(md)))
+    (tmp_path / "Cargo.toml").write_text("[package]\nname='x'\nversion='0.1'\n")
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=tmp_path, check=True)
+    # Pending edit to a non-Rust file - rust checks should be skipped (no
+    # relevant extension), but the stack detection should still log "rust".
+    (tmp_path / "README.md").write_text("# hi\n")
+
+    async def mount_md(_h): return _FakeMd()
+    log_records: list[dict] = []
+    ctx = ReviewRunCtx(
+        cwd=tmp_path,
+        huginn_agent_factory=lambda: _FakeAgent("h", "no findings"),
+        review_prompt="checks={checks}\ndiff={diff}",
+        model_settings=ModelSettings(),
+        log=log_records.append,
+        mount_muninn_md=mount_md,
+        mount_huginn_md=mount_md,
+    )
+    summary = await precommit_review_flow(ctx)
+    assert summary["type"] == "review_complete"
+    assert any(r.get("type") == "stack_detected" and r.get("stack") == "rust"
+               for r in log_records)
+    # No rust check should have run because the diff has no .rs files.
+    rust_check_runs = [r for r in log_records
+                       if r.get("type") == "review_check"
+                       and r.get("name") in {"cargo clippy", "cargo check", "cargo test"}]
+    assert rust_check_runs == []
+
+
+async def test_review_flow_runs_huginn_with_diff(tmp_path, monkeypatch) -> None:
+    from textual.widgets import Markdown
+    monkeypatch.setattr(Markdown, "get_stream",
+                        classmethod(lambda cls, md: _FakeStream(md)))
+    _git_init_with_pending_change(tmp_path)
+
+    seen_prompts: list[str] = []
+
+    class _SpyAgent:
+        async def run_stream_events(self, prompt, *, message_history=None, model_settings=None):
+            from pydantic_ai.messages import PartDeltaEvent, TextPartDelta
+            from pydantic_ai.run import AgentRunResultEvent
+            seen_prompts.append(prompt)
+            yield PartDeltaEvent(index=0, delta=TextPartDelta(content_delta="1. thing.py:2 missing newline\nWhy: style.\nFix: add newline.\nfindings flagged"))
+            class _R:
+                def __init__(self, text): self.output = text
+                def new_messages(self): return []
+            yield AgentRunResultEvent(result=_R("done"))
+
+    async def mount_md(_h): return _FakeMd()
+    log_records: list[dict] = []
+
+    ctx = ReviewRunCtx(
+        cwd=tmp_path,
+        huginn_agent_factory=_SpyAgent,
+        review_prompt="checks={checks}\n---\ndiff={diff}",
+        model_settings=ModelSettings(),
+        log=log_records.append,
+        mount_muninn_md=mount_md,
+        mount_huginn_md=mount_md,
+    )
+    summary = await precommit_review_flow(ctx)
+    assert summary["type"] == "review_complete"
+    assert summary["no_findings"] is False
+    # Huginn was given a real diff.
+    assert len(seen_prompts) == 1
+    assert "+y = 2" in seen_prompts[0]
+    # Verdict was logged.
+    assert any(r.get("type") == "review_verdict" for r in log_records)
+
+
+# ---------------------------------------------------------------------------
+# freedom_level backstop short-circuit
+# ---------------------------------------------------------------------------
+
+
+async def test_feature_backstop_auto_proceeds_at_high(monkeypatch) -> None:
+    """At freedom_level='high', the unconverged backstop never asks - it
+    logs feature_unconverged_autoproceed and falls through to implementation."""
+    from textual.widgets import Markdown
+    monkeypatch.setattr(Markdown, "get_stream",
+                        classmethod(lambda cls, md: _FakeStream(md)))
+    log_records: list[dict] = []
+    asked: list[int] = []
+
+    async def must_not_ask(_q, _opts):
+        asked.append(1)
+        return "should-not-be-called"
+
+    ctx = _make_unconverged_ctx(must_not_ask, log_records)
+    ctx.freedom_level = "high"
+    summary = await feature_flow(ctx)
+    assert summary["type"] == "feature_complete"
+    assert asked == [], "ask_user must not be called at freedom_level=high"
+    assert any(r.get("type") == "feature_unconverged_autoproceed"
+               for r in log_records)
+
+
+async def test_feature_backstop_asks_at_medium(monkeypatch) -> None:
+    """At freedom_level='medium', the existing 4-option backstop still fires."""
+    from textual.widgets import Markdown
+    monkeypatch.setattr(Markdown, "get_stream",
+                        classmethod(lambda cls, md: _FakeStream(md)))
+    log_records: list[dict] = []
+    seen_options: list[list] = []
+
+    async def ask_proceed(_q, opts):
+        seen_options.append(list(opts))
+        return _pick(opts, "proceed")
+
+    ctx = _make_unconverged_ctx(ask_proceed, log_records)
+    ctx.freedom_level = "medium"
+    summary = await feature_flow(ctx)
+    assert summary["type"] == "feature_complete"
+    assert len(seen_options) >= 1, "backstop must call ask_user at medium"
+    assert not any(r.get("type") == "feature_unconverged_autoproceed"
+                   for r in log_records)
+
+
+async def test_feature_backstop_asks_at_low(monkeypatch) -> None:
+    from textual.widgets import Markdown
+    monkeypatch.setattr(Markdown, "get_stream",
+                        classmethod(lambda cls, md: _FakeStream(md)))
+    log_records: list[dict] = []
+    asked: list[int] = []
+
+    async def ask_proceed(_q, opts):
+        asked.append(1)
+        return _pick(opts, "proceed")
+
+    ctx = _make_unconverged_ctx(ask_proceed, log_records)
+    ctx.freedom_level = "low"
+    summary = await feature_flow(ctx)
+    assert summary["type"] == "feature_complete"
+    assert asked, "low must ask"
+    assert not any(r.get("type") == "feature_unconverged_autoproceed"
+                   for r in log_records)
+
+
+async def test_bug_backstop_auto_proceeds_at_high(monkeypatch) -> None:
+    """Bug-flow parity: high skips the 4-option backstop and runs through
+    failing-test + fix steps."""
+    from textual.widgets import Markdown
+    monkeypatch.setattr(Markdown, "get_stream",
+                        classmethod(lambda cls, md: _FakeStream(md)))
+    log_records: list[dict] = []
+    asked: list[int] = []
+
+    async def must_not_ask(_q, _opts):
+        asked.append(1)
+        return "should-not-be-called"
+
+    ctx = _make_bug_ctx(
+        muninn_output="problem doc",
+        huginn_outputs=["bad.\ndesign needs revision"] * 10,
+        ask_user_fn=must_not_ask,
+        log_records=log_records,
+    )
+    ctx.freedom_level = "high"
+    summary = await bug_flow(ctx)
+    assert summary["type"] == "bug_complete"
+    assert asked == [], "ask_user must not be called at freedom_level=high"
+    assert any(r.get("type") == "bug_unconverged_autoproceed"
+               for r in log_records)
+
+
+async def test_bug_backstop_asks_at_medium(monkeypatch) -> None:
+    from textual.widgets import Markdown
+    monkeypatch.setattr(Markdown, "get_stream",
+                        classmethod(lambda cls, md: _FakeStream(md)))
+    log_records: list[dict] = []
+    asked: list[int] = []
+
+    async def ask_proceed(_q, opts):
+        asked.append(1)
+        return _pick(opts, "proceed")
+
+    ctx = _make_bug_ctx(
+        muninn_output="problem doc",
+        huginn_outputs=["bad.\ndesign needs revision"] * 10,
+        ask_user_fn=ask_proceed,
+        log_records=log_records,
+    )
+    ctx.freedom_level = "medium"
+    summary = await bug_flow(ctx)
+    assert summary["type"] == "bug_complete"
+    assert asked, "medium must call ask_user"
+    assert not any(r.get("type") == "bug_unconverged_autoproceed"
+                   for r in log_records)
+
+
+async def test_bug_backstop_asks_at_low(monkeypatch) -> None:
+    from textual.widgets import Markdown
+    monkeypatch.setattr(Markdown, "get_stream",
+                        classmethod(lambda cls, md: _FakeStream(md)))
+    log_records: list[dict] = []
+    asked: list[int] = []
+
+    async def ask_proceed(_q, opts):
+        asked.append(1)
+        return _pick(opts, "proceed")
+
+    ctx = _make_bug_ctx(
+        muninn_output="problem doc",
+        huginn_outputs=["bad.\ndesign needs revision"] * 10,
+        ask_user_fn=ask_proceed,
+        log_records=log_records,
+    )
+    ctx.freedom_level = "low"
+    summary = await bug_flow(ctx)
+    assert summary["type"] == "bug_complete"
+    assert asked, "low must call ask_user"

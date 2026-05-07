@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "muninn"
+version = "0.1.1"
+description = "Local LLM CLI: stateful memory-keeping co-author paired with stateless cold-reader"
+requires-python = ">=3.14"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = [
+    "textual>=8",
+    "pydantic-ai>=1.90",
+    "httpx>=0.27",
+    "tomli-w>=1",
+    "textual-autocomplete>=4",
+]
+
+[project.scripts]
+muninn = "muninn.app:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["muninn"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
