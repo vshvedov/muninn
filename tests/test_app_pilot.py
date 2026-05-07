@@ -159,6 +159,9 @@ async def test_escape_calls_cancel_workers(patched_app, tmp_path, monkeypatch):
         await pilot.pause()
         assert "muninn" in cancelled
         assert "feature" in cancelled
+        # /brainstorm and /prd workers must also cancel on Esc.
+        assert "brainstorm" in cancelled
+        assert "prd" in cancelled
 
 
 async def test_slash_candidates_returns_empty_for_plain_chat() -> None:
@@ -326,6 +329,8 @@ async def test_help_text_appears_in_intro(patched_app, tmp_path):
         assert "/feature" in joined
         assert "/bug" in joined
         assert "/precommit-review" in joined
+        assert "/brainstorm" in joined
+        assert "/prd" in joined
 
 
 async def test_ollama_not_installed_detection(tmp_path, monkeypatch):
@@ -539,3 +544,127 @@ def test_main_update_with_no_extra_args_calls_run_update(monkeypatch):
     monkeypatch.setattr(app_mod, "_run_update", lambda: called.append(True))
     app_mod.main(["update"])
     assert called == [True], "main(['update']) must call _run_update once"
+
+
+# =====================================================================
+# /brainstorm and /prd dispatch + registry consistency
+# =====================================================================
+
+
+def test_slash_command_registry_consistency() -> None:
+    """The slash-command surface (dropdown, taking-arg set, help text,
+    cancel groups) must stay in sync. Stops the next /command from being
+    half-wired and producing silent UX bugs.
+    """
+    from muninn.app import (
+        SLASH_COMMANDS, _COMMANDS_TAKING_ARG, _CANCEL_GROUPS, HELP_TEXT,
+    )
+
+    # Both new commands appear in the dropdown registry.
+    cmds = [c for c, _ in SLASH_COMMANDS]
+    for cmd in ("/feature", "/bug", "/precommit-review", "/brainstorm", "/prd"):
+        assert cmd in cmds, f"{cmd} missing from SLASH_COMMANDS"
+
+    # Both new commands take a description argument.
+    for cmd in ("/feature", "/bug", "/brainstorm", "/prd"):
+        assert cmd in _COMMANDS_TAKING_ARG, f"{cmd} missing from _COMMANDS_TAKING_ARG"
+
+    # All command-taking-arg entries must have a SLASH_COMMANDS entry too.
+    for cmd in _COMMANDS_TAKING_ARG:
+        assert cmd in cmds, f"{cmd} in _COMMANDS_TAKING_ARG but not SLASH_COMMANDS"
+
+    # Both new commands appear in the help block.
+    for cmd in ("/feature", "/bug", "/precommit-review", "/brainstorm", "/prd"):
+        assert cmd in HELP_TEXT, f"{cmd} missing from HELP_TEXT"
+
+    # Both new worker groups are cancellable on Esc.
+    for group in ("brainstorm", "prd"):
+        assert group in _CANCEL_GROUPS, f"{group} missing from _CANCEL_GROUPS"
+
+
+async def test_pilot_brainstorm_dispatch(patched_app, tmp_path, monkeypatch):
+    """Submitting `/brainstorm <text>` must spawn a worker in group
+    'brainstorm'. Verifies dispatch wiring without running the LLM flow.
+    """
+    spawned: list[str] = []
+
+    def spy(self, description):
+        spawned.append(description)
+
+    from muninn import app as app_mod
+    # Patch the worker's underlying coroutine method so it does NOT run
+    # the actual brainstorm_flow; we only care that dispatch hit the
+    # @work-decorated method, which still uses worker scheduling.
+    monkeypatch.setattr(
+        app_mod.MuninnTUI, "_run_brainstorm_worker",
+        lambda self, description: spawned.append(description),
+    )
+
+    async with patched_app.run_test() as pilot:
+        for _ in range(20):
+            await pilot.pause()
+            if patched_app.health_status == "ok":
+                break
+        from textual.widgets import Input
+        inp = patched_app.query_one("#user-input", Input)
+        inp.value = "/brainstorm what if huginn voted on diffs"
+        await pilot.press("enter")
+        await pilot.pause()
+
+    assert spawned == ["what if huginn voted on diffs"], spawned
+
+
+async def test_pilot_prd_dispatch(patched_app, tmp_path, monkeypatch):
+    """Submitting `/prd <text>` must dispatch to _run_prd_worker."""
+    spawned: list[str] = []
+    from muninn import app as app_mod
+    monkeypatch.setattr(
+        app_mod.MuninnTUI, "_run_prd_worker",
+        lambda self, description: spawned.append(description),
+    )
+
+    async with patched_app.run_test() as pilot:
+        for _ in range(20):
+            await pilot.pause()
+            if patched_app.health_status == "ok":
+                break
+        from textual.widgets import Input
+        inp = patched_app.query_one("#user-input", Input)
+        inp.value = "/prd add a persistent transcript pane"
+        await pilot.press("enter")
+        await pilot.pause()
+
+    assert spawned == ["add a persistent transcript pane"], spawned
+
+
+async def test_pilot_brainstorm_empty_arg_echoes_hint(patched_app, tmp_path, monkeypatch):
+    """`/brainstorm` with no argument must NOT spawn a worker; it must
+    echo a hint instead, mirroring /feature and /bug behavior."""
+    spawned: list[str] = []
+    from muninn import app as app_mod
+    monkeypatch.setattr(
+        app_mod.MuninnTUI, "_run_brainstorm_worker",
+        lambda self, description: spawned.append(description),
+    )
+
+    async with patched_app.run_test() as pilot:
+        for _ in range(20):
+            await pilot.pause()
+            if patched_app.health_status == "ok":
+                break
+        from textual.widgets import Input, Markdown
+        inp = patched_app.query_one("#user-input", Input)
+        inp.value = "/brainstorm"
+        await inp.action_submit()
+        await pilot.pause()
+        await pilot.pause()
+
+        assert spawned == [], "no worker must spawn for empty /brainstorm"
+        # The hint message landed in the muninn pane.
+        mds = patched_app.query("#muninn-scroll Markdown").results(Markdown)
+        joined = "\n".join(
+            str(getattr(m, "_markdown", "") or "") for m in mds
+        )
+        assert "/brainstorm requires a rough idea" in joined, (
+            f"hint not found in pane; got widgets:\n{joined[:2000]}"
+        )

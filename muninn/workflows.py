@@ -1,10 +1,11 @@
-"""Workflows: /feature (design loop) and /precommit-review (diff cold-read)."""
+"""Workflows: /feature, /bug, /brainstorm, /prd, /precommit-review."""
 from __future__ import annotations
 
 import ast
 import asyncio
 import re
 from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -1068,6 +1069,659 @@ async def bug_flow(ctx: BugRunCtx) -> dict[str, Any]:
         f"test {len(test_text)}b · "
         f"fix {len(fix_text)}b"
     )
+    return summary
+
+
+# =====================================================================
+# /brainstorm and /prd  - parallel-lens fan-out
+# =====================================================================
+#
+# The article's goldfish work is sequential validation (comprehension /
+# critic / readiness gates). /brainstorm and /prd extend the pattern to
+# upstream ideation and requirements: multiple Huginns evaluate the same
+# input through deliberately asymmetric role injections, in parallel,
+# then Muninn synthesizes. PRD line 223 acknowledges parallel is "fake
+# speedup on a single GPU" because Ollama serializes generations per
+# model; we keep parallel-in-code for clean structure and forward
+# compatibility with vLLM, not for wall-clock speedup.
+
+# /brainstorm lenses
+LENS_TECHNICAL = "technical"
+LENS_CONTRARIAN = "contrarian"
+LENS_UX = "ux"
+BRAINSTORM_LENSES: tuple[str, ...] = (LENS_TECHNICAL, LENS_CONTRARIAN, LENS_UX)
+
+# /prd research lenses
+LENS_PRIOR_ART = "prior_art"
+LENS_EDGE_CASES = "edge_cases"
+LENS_INTEGRATION = "integration"
+PRD_LENSES: tuple[str, ...] = (LENS_PRIOR_ART, LENS_EDGE_CASES, LENS_INTEGRATION)
+
+
+@dataclass
+class BrainstormRunCtx:
+    """Context for the /brainstorm flow.
+
+    Ground (Muninn) -> 3 parallel Huginn lenses -> Muninn synthesis ->
+    workflow writes docs/brainstorms/<slug>-<date>.md via Path.write_text
+    (deterministic, bypasses the write_file tool gate, independent of
+    freedom_level). No revision loop. No critic/readiness gate on the
+    output - user chains /prd or /feature for that.
+    """
+    description: str
+    cwd: Path  # project root, where docs/brainstorms/ lands
+    muninn_agent: Agent
+    huginn_agent_factory: Callable[[], Agent]
+    muninn_history: list[ModelMessage]
+    brainstorm_ground_prompt: str            # contains "{description}"
+    brainstorm_lens_prompts: dict[str, str]  # keys = BRAINSTORM_LENSES; values "{description}", "{ground_brief}"
+    brainstorm_synthesis_prompt: str         # "{description}", "{ground_brief}", "{lens_outputs}"
+    model_settings: ModelSettings
+    log: LogFn
+    mount_muninn_md: MdFactory
+    mount_huginn_md: MdFactory
+
+
+@dataclass
+class PRDRunCtx:
+    """Context for the /prd flow.
+
+    Ground -> single Muninn QA turn (3-5 ask_user calls + Q&A summary
+    block) -> 3 parallel Huginn research lenses -> Muninn synthesis ->
+    workflow writes docs/prds/<slug>-<date>.md.
+    """
+    description: str
+    cwd: Path
+    muninn_agent: Agent
+    huginn_agent_factory: Callable[[], Agent]
+    muninn_history: list[ModelMessage]
+    prd_ground_prompt: str               # "{description}"
+    prd_qa_prompt: str                   # "{description}", "{ground_brief}"
+    prd_lens_prompts: dict[str, str]     # keys = PRD_LENSES; values "{description}", "{ground_brief}", "{qa_summary}"
+    prd_synthesis_prompt: str            # "{description}", "{ground_brief}", "{qa_summary}", "{lens_outputs}"
+    model_settings: ModelSettings
+    log: LogFn
+    mount_muninn_md: MdFactory
+    mount_huginn_md: MdFactory
+
+
+# ---- helpers --------------------------------------------------------
+
+# Tokens the QA prompt instructs Muninn to emit at the tail of its
+# Q&A summary. Tolerant parse (substring on the lower-cased tail) -
+# matches the same pattern as _verdict() above. If neither token is
+# present, we proceed with whatever Muninn returned as qa_summary
+# (logged as prd_qa_no_token).
+_QA_TOKEN_COMPLETE = "qa complete"
+_QA_TOKEN_SKIPPED = "no clarifications gathered"
+
+
+def _slug_for_path(description: str, max_len: int = 60) -> str:
+    """Lowercase; non-alnum runs collapse to a single '-'; strip leading
+    /trailing '-'; truncate to max_len then re-strip; empty result -> 'idea'.
+
+    Pure, synchronous. Non-ASCII characters are dropped (since
+    `[^a-z0-9]+` doesn't match unicode word chars). Tested across
+    edge cases (empty, all-symbol, very long, double-dash).
+    """
+    s = description.lower()
+    s = re.sub(r"[^a-z0-9]+", "-", s)
+    s = s.strip("-")
+    if len(s) > max_len:
+        s = s[:max_len].rstrip("-")
+    return s or "idea"
+
+
+def _unique_artifact_path(
+    cwd: Path,
+    subdir: str,
+    slug: str,
+    *,
+    now: datetime | None = None,
+) -> Path:
+    """Return absolute Path under cwd/docs/<subdir>/.
+
+    Tries `<slug>-<YYYY-MM-DD>.md` first; on collision, `<slug>-<date>-<HHMMSS>.md`;
+    on a second collision (impossible single-process per PRD F1), raises
+    FileExistsError.
+
+    Does NOT create directories. Does NOT write the file. Caller writes.
+    `now` is injectable for deterministic tests.
+    """
+    when = now or datetime.now()
+    base_dir = cwd / "docs" / subdir
+    primary = base_dir / f"{slug}-{when.strftime('%Y-%m-%d')}.md"
+    if not primary.exists():
+        return primary
+    secondary = base_dir / f"{slug}-{when.strftime('%Y-%m-%d')}-{when.strftime('%H%M%S')}.md"
+    if not secondary.exists():
+        return secondary
+    raise FileExistsError(
+        f"both {primary.name} and {secondary.name} already exist; "
+        f"single-process race not expected (PRD F1)"
+    )
+
+
+def _format_lens_outputs(
+    order: tuple[str, ...],
+    results: dict[str, str],
+    failures: dict[str, str],
+) -> str:
+    """Build the synthesis-prompt input for the {lens_outputs} placeholder.
+
+    Iterates `order` (deterministic; matches BRAINSTORM_LENSES or PRD_LENSES).
+    For each lens, emits a fenced block:
+
+        --- LENS: <name> ---
+        <text or placeholder>
+        --- END LENS: <name> ---
+
+    Failed lenses get `(lens unavailable: <ExcClassName>)` as the body. Joined
+    by blank lines.
+
+    Invariant (asserted): every lens in `order` MUST appear in exactly one
+    of `results` or `failures` (the dicts must be disjoint and together
+    cover `order`). Protects against future refactors that drift the dict
+    contracts apart.
+    """
+    keys_results = set(results.keys())
+    keys_failures = set(failures.keys())
+    assert keys_results.isdisjoint(keys_failures), (
+        f"results and failures must be disjoint, got overlap "
+        f"{keys_results & keys_failures}"
+    )
+    assert set(order) <= (keys_results | keys_failures), (
+        f"every lens in order must appear in results or failures; "
+        f"missing {set(order) - (keys_results | keys_failures)}"
+    )
+    parts: list[str] = []
+    for lens in order:
+        if lens in results:
+            body = results[lens] or "(empty)"
+        else:
+            body = f"(lens unavailable: {failures[lens]})"
+        parts.append(
+            f"--- LENS: {lens} ---\n{body}\n--- END LENS: {lens} ---"
+        )
+    return "\n\n".join(parts)
+
+
+async def _fan_out_lenses(
+    *,
+    huginn_agent_factory: Callable[[], Agent],
+    lens_prompts: dict[str, str],   # already-formatted prompts, keyed by lens name
+    lens_order: tuple[str, ...],    # deterministic iteration; same as BRAINSTORM_LENSES or PRD_LENSES
+    mount_huginn_md: MdFactory,
+    log: LogFn,
+    model_settings: ModelSettings,
+    flow_label: str,                # "brainstorm" | "prd-research"; tags JSONL events
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Run N Huginn cold-reads in parallel; return (results, failures).
+
+    Step 1 (SEQUENTIAL): for each lens in lens_order, mount its streaming
+    Markdown widget and mint its Huginn agent. Both happen synchronously,
+    in tuple order, BEFORE any task starts. This is load-bearing - it
+    eliminates the concurrent-mount interleave that would otherwise produce
+    header-A / header-B / body-A / body-B ordering. DO NOT rewrite this
+    block to use asyncio.gather over the mount calls.
+
+    Step 2 (PARALLEL): asyncio.gather over per-lens coroutines. NO
+    return_exceptions=True - that would swallow CancelledError as a
+    successful result (Esc would never propagate). Each lens task self-
+    catches `Exception` (NOT BaseException, NOT bare except - CancelledError
+    must propagate) and records its own failure.
+
+    Step 3: build {lens: text} and {lens: ExcClassName} dicts (disjoint;
+    together cover lens_order); return both.
+    """
+    # Step 1: sequential mount + factory in tuple order.
+    prepared: list[tuple[str, Any, Agent, str]] = []
+    for lens in lens_order:
+        header = f"👁️  **Huginn · {lens} lens · thinking…**"
+        md = await mount_huginn_md(header)
+        agent = huginn_agent_factory()
+        prompt = lens_prompts[lens]
+        prepared.append((lens, md, agent, prompt))
+        log({"type": "lens_started", "flow": flow_label, "lens": lens})
+
+    async def _run_one(lens: str, md, agent: Agent, prompt: str) -> tuple[str, str, str]:
+        # MUST be `except Exception`, not bare `except` or `except BaseException`.
+        # CancelledError inherits from BaseException (not Exception) and must
+        # propagate so Esc cancellation works.
+        try:
+            text, _ = await run_and_stream(
+                agent,
+                prompt,
+                md,
+                message_history=None,   # Huginn is always stateless cold-read
+                log=log,
+                model_settings=model_settings,
+                label=f"huginn-{flow_label}-{lens}",
+            )
+            log({"type": "lens_completed", "flow": flow_label,
+                 "lens": lens, "len": len(text)})
+            return (lens, text, "")
+        except Exception as exc:
+            exc_class = type(exc).__name__
+            log({"type": "lens_failed", "flow": flow_label, "lens": lens,
+                 "exc": exc_class, "msg": str(exc)})
+            try:
+                await md.append(
+                    f"\n\n❌ **Huginn · {lens} lens · failed:** "
+                    f"{exc_class}: {exc}"
+                )
+            except Exception:
+                pass
+            return (lens, "", exc_class)
+
+    # Step 2: parallel streaming. NO return_exceptions=True.
+    triples = await asyncio.gather(
+        *(_run_one(lens, md, agent, prompt)
+          for lens, md, agent, prompt in prepared)
+    )
+
+    # Step 3: split into disjoint dicts.
+    results: dict[str, str] = {}
+    failures: dict[str, str] = {}
+    for lens, text, exc_class in triples:
+        if exc_class:
+            failures[lens] = exc_class
+        else:
+            results[lens] = text
+    return results, failures
+
+
+def _artifact_body(
+    *,
+    flow_kind: str,                 # "brainstorm" | "prd"
+    description: str,
+    today: date,
+    synthesis_text: str,
+    lens_order: tuple[str, ...],
+    lens_results: dict[str, str],
+    lens_failures: dict[str, str],
+    qa_summary: str | None = None,  # /prd only
+) -> str:
+    """Build the markdown content of the artifact file.
+
+    Header + synthesis + (optional Q&A summary for /prd) + verbatim lens
+    outputs (one ### Lens: <name> section each, including failed lenses
+    with the unavailable marker). Pure, synchronous. Muninn does NOT
+    format the file; this helper is the single source of truth so the
+    artifact is deterministic regardless of model output drift.
+    """
+    heading = "Brainstorm" if flow_kind == "brainstorm" else "PRD"
+    parts: list[str] = [
+        f"# {heading}: {description}",
+        "",
+        f"Generated {today.isoformat()} by `/{flow_kind}`.",
+        "",
+        "## Synthesis",
+        "",
+        synthesis_text.strip() or "_(synthesis was empty)_",
+    ]
+    if qa_summary is not None:
+        parts.extend([
+            "",
+            "## Q&A summary",
+            "",
+            qa_summary.strip() or "_(no Q&A captured)_",
+        ])
+    parts.extend(["", "## Lens outputs (verbatim)"])
+    for lens in lens_order:
+        parts.extend(["", f"### Lens: {lens}", ""])
+        if lens in lens_results:
+            parts.append(lens_results[lens].strip() or "_(empty)_")
+        else:
+            parts.append(
+                f"_(lens unavailable: {lens_failures.get(lens, 'unknown')})_"
+            )
+    return "\n".join(parts) + "\n"
+
+
+# ---- /brainstorm flow ----------------------------------------------
+
+async def brainstorm_flow(ctx: BrainstormRunCtx) -> dict[str, Any]:
+    """Run the /brainstorm pipeline. Returns a summary dict.
+
+    Steps:
+      1. Ground (Muninn): explore the codebase, output a short brief.
+      2. Fan out 3 Huginn lenses in parallel: technical / contrarian / UX.
+      3. Synthesize (Muninn): convergent themes / divergent / next step.
+      4. Save artifact to docs/brainstorms/<slug>-<date>.md (workflow writes,
+         not via tool surface).
+
+    Returns one of:
+      - {"type": "brainstorm_complete", description, artifact_path,
+         synthesis_len, lens_outputs: {lens: len},
+         lens_failures: {lens: ExcClass}}
+      - {"type": "brainstorm_partial", ...} when synthesis raised but lens
+         outputs are still worth saving.
+      - {"type": "brainstorm_failed", description, reason, lens_failures}
+         when ALL lenses failed (synthesis is skipped).
+    """
+    ctx.log({"type": "brainstorm_started", "description": ctx.description})
+    await ctx.mount_muninn_md(f"### 💡 `/brainstorm` - {ctx.description}")
+
+    # Step 1: Ground.
+    ground_md = await ctx.mount_muninn_md(
+        "🐦‍⬛ **Muninn · step 1/4 · grounding the idea space**"
+    )
+    ground_prompt = ctx.brainstorm_ground_prompt.format(description=ctx.description)
+    ground_text, ctx.muninn_history = await run_and_stream(
+        ctx.muninn_agent,
+        ground_prompt,
+        ground_md,
+        message_history=ctx.muninn_history,
+        log=ctx.log,
+        model_settings=ctx.model_settings,
+        label="muninn-brainstorm-ground",
+    )
+    ctx.log({"type": "brainstorm_grounded", "len": len(ground_text)})
+
+    # Step 2: Fan out 3 lenses in parallel.
+    await ctx.mount_muninn_md(
+        "🐦‍⬛ **Muninn · step 2/4 · fanning out 3 Huginn lenses**"
+    )
+    lens_prompts = {
+        lens: ctx.brainstorm_lens_prompts[lens].format(
+            description=ctx.description,
+            ground_brief=ground_text,
+        )
+        for lens in BRAINSTORM_LENSES
+    }
+    lens_results, lens_failures = await _fan_out_lenses(
+        huginn_agent_factory=ctx.huginn_agent_factory,
+        lens_prompts=lens_prompts,
+        lens_order=BRAINSTORM_LENSES,
+        mount_huginn_md=ctx.mount_huginn_md,
+        log=ctx.log,
+        model_settings=ctx.model_settings,
+        flow_label="brainstorm",
+    )
+
+    # All-fail short-circuit: skip synthesis and save nothing. The worker
+    # echoes the user-facing abort line; the flow only logs and returns
+    # the summary dict so user-facing prose lives in one place.
+    if not lens_results:
+        reason = (
+            f"all {len(BRAINSTORM_LENSES)} lenses failed: "
+            + "; ".join(f"{lens}={exc}" for lens, exc in lens_failures.items())
+        )
+        ctx.log({"type": "brainstorm_failed",
+                 "description": ctx.description,
+                 "reason": reason, "lens_failures": lens_failures})
+        return {
+            "type": "brainstorm_failed",
+            "description": ctx.description,
+            "reason": reason,
+            "lens_failures": lens_failures,
+        }
+
+    # Step 3: Synthesize.
+    syn_md = await ctx.mount_muninn_md(
+        f"🐦‍⬛ **Muninn · step 3/4 · synthesizing "
+        f"{len(lens_results)} lens(es)**"
+    )
+    ctx.log({"type": "brainstorm_synthesizing",
+             "successful_lens_count": len(lens_results)})
+    synthesis_prompt = ctx.brainstorm_synthesis_prompt.format(
+        description=ctx.description,
+        ground_brief=ground_text,
+        lens_outputs=_format_lens_outputs(
+            BRAINSTORM_LENSES, lens_results, lens_failures
+        ),
+    )
+
+    synthesis_failed: str | None = None
+    try:
+        synthesis_text, ctx.muninn_history = await run_and_stream(
+            ctx.muninn_agent,
+            synthesis_prompt,
+            syn_md,
+            message_history=ctx.muninn_history,
+            log=ctx.log,
+            model_settings=ctx.model_settings,
+            label="muninn-brainstorm-synthesis",
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        synthesis_failed = type(exc).__name__
+        synthesis_text = (
+            f"_Synthesis failed: {synthesis_failed}: {exc}. Lens outputs "
+            f"preserved verbatim below for manual review._"
+        )
+        ctx.log({"type": "brainstorm_synthesis_failed",
+                 "exc": synthesis_failed, "msg": str(exc)})
+
+    # Step 4: Save artifact.
+    await ctx.mount_muninn_md("🐦‍⬛ **Muninn · step 4/4 · saving artifact**")
+    slug = _slug_for_path(ctx.description)
+    path = _unique_artifact_path(ctx.cwd, "brainstorms", slug)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = _artifact_body(
+        flow_kind="brainstorm",
+        description=ctx.description,
+        today=date.today(),
+        synthesis_text=synthesis_text,
+        lens_order=BRAINSTORM_LENSES,
+        lens_results=lens_results,
+        lens_failures=lens_failures,
+    )
+    path.write_text(body, encoding="utf-8")
+    rel = str(path.relative_to(ctx.cwd))
+
+    summary: dict[str, Any] = {
+        "type": "brainstorm_partial" if synthesis_failed else "brainstorm_complete",
+        "description": ctx.description,
+        "artifact_path": rel,
+        "synthesis_len": len(synthesis_text),
+        "lens_outputs": {lens: len(lens_results.get(lens, ""))
+                         for lens in BRAINSTORM_LENSES},
+        "lens_failures": dict(lens_failures),
+        "successful_lens_count": len(lens_results),
+        "failed_lens_count": len(lens_failures),
+    }
+    if synthesis_failed:
+        summary["synthesis_failed"] = synthesis_failed
+        await ctx.mount_muninn_md(
+            f"⚠️ **/brainstorm partial** · synthesis failed "
+            f"({synthesis_failed}); lens outputs saved to {rel}"
+        )
+    else:
+        await ctx.mount_muninn_md(
+            f"✅ **/brainstorm complete** · _{len(lens_results)} lens(es) · "
+            f"synthesis {len(synthesis_text)}b · saved to {rel}_"
+        )
+    ctx.log(summary)
+    return summary
+
+
+# ---- /prd flow -----------------------------------------------------
+
+async def prd_flow(ctx: PRDRunCtx) -> dict[str, Any]:
+    """Run the /prd pipeline. Returns a summary dict.
+
+    Steps:
+      1. Ground (Muninn): explore the codebase + identify user-input gaps.
+      2. QA (Muninn single turn): 3-5 ask_user calls + Q&A summary block.
+      3. Fan out 3 Huginn research lenses: prior_art / edge_cases / integration.
+      4. Synthesize (Muninn): full PRD matching docs/prds/ template.
+      5. Save artifact to docs/prds/<slug>-<date>.md.
+
+    Returns: prd_complete / prd_partial / prd_failed (same shape as
+    /brainstorm with `prd_` prefix).
+    """
+    ctx.log({"type": "prd_started", "description": ctx.description})
+    await ctx.mount_muninn_md(f"### 📋 `/prd` - {ctx.description}")
+
+    # Step 1: Ground.
+    ground_md = await ctx.mount_muninn_md(
+        "🐦‍⬛ **Muninn · step 1/5 · grounding (codebase landmarks)**"
+    )
+    ground_prompt = ctx.prd_ground_prompt.format(description=ctx.description)
+    ground_text, ctx.muninn_history = await run_and_stream(
+        ctx.muninn_agent,
+        ground_prompt,
+        ground_md,
+        message_history=ctx.muninn_history,
+        log=ctx.log,
+        model_settings=ctx.model_settings,
+        label="muninn-prd-ground",
+    )
+    ctx.log({"type": "prd_grounded", "len": len(ground_text)})
+
+    # Step 2: Single Muninn QA turn (3-5 ask_user calls + summary block).
+    qa_md = await ctx.mount_muninn_md(
+        "🐦‍⬛ **Muninn · step 2/5 · structured Q&A (3-5 gaps)**"
+    )
+    ctx.log({"type": "prd_qa_started"})
+    qa_prompt = ctx.prd_qa_prompt.format(
+        description=ctx.description, ground_brief=ground_text,
+    )
+    qa_summary, ctx.muninn_history = await run_and_stream(
+        ctx.muninn_agent,
+        qa_prompt,
+        qa_md,
+        message_history=ctx.muninn_history,
+        log=ctx.log,
+        model_settings=ctx.model_settings,
+        label="muninn-prd-qa",
+    )
+    qa_tail = qa_summary.strip().lower()
+    qa_window = qa_tail[-200:]
+    # Both checks use substring-on-tail for symmetry; SKIPPED checked first
+    # because it's the rarer outcome and would otherwise be masked if the
+    # model's output happened to also include the substring "qa complete"
+    # somewhere in the body.
+    if _QA_TOKEN_SKIPPED in qa_window:
+        ctx.log({"type": "prd_qa_skipped", "len": len(qa_summary)})
+    elif _QA_TOKEN_COMPLETE in qa_window:
+        ctx.log({"type": "prd_qa_complete",
+                 "len": len(qa_summary), "had_questions": True})
+    else:
+        # Tolerant: model didn't emit either closing token. Proceed with
+        # whatever it returned. Mirrors _verdict()'s tolerance pattern.
+        ctx.log({"type": "prd_qa_no_token", "len": len(qa_summary)})
+
+    # Step 3: Fan out 3 research lenses in parallel.
+    await ctx.mount_muninn_md(
+        "🐦‍⬛ **Muninn · step 3/5 · fanning out 3 research lenses**"
+    )
+    lens_prompts = {
+        lens: ctx.prd_lens_prompts[lens].format(
+            description=ctx.description,
+            ground_brief=ground_text,
+            qa_summary=qa_summary,
+        )
+        for lens in PRD_LENSES
+    }
+    lens_results, lens_failures = await _fan_out_lenses(
+        huginn_agent_factory=ctx.huginn_agent_factory,
+        lens_prompts=lens_prompts,
+        lens_order=PRD_LENSES,
+        mount_huginn_md=ctx.mount_huginn_md,
+        log=ctx.log,
+        model_settings=ctx.model_settings,
+        flow_label="prd-research",
+    )
+
+    if not lens_results:
+        # Worker echoes the user-facing abort line; flow only logs.
+        reason = (
+            f"all {len(PRD_LENSES)} lenses failed: "
+            + "; ".join(f"{lens}={exc}" for lens, exc in lens_failures.items())
+        )
+        ctx.log({"type": "prd_failed",
+                 "description": ctx.description,
+                 "reason": reason, "lens_failures": lens_failures})
+        return {
+            "type": "prd_failed",
+            "description": ctx.description,
+            "reason": reason,
+            "lens_failures": lens_failures,
+        }
+
+    # Step 4: Synthesize the PRD.
+    syn_md = await ctx.mount_muninn_md(
+        f"🐦‍⬛ **Muninn · step 4/5 · synthesizing PRD "
+        f"({len(lens_results)} lens(es))**"
+    )
+    ctx.log({"type": "prd_synthesizing",
+             "successful_lens_count": len(lens_results)})
+    synthesis_prompt = ctx.prd_synthesis_prompt.format(
+        description=ctx.description,
+        ground_brief=ground_text,
+        qa_summary=qa_summary,
+        lens_outputs=_format_lens_outputs(
+            PRD_LENSES, lens_results, lens_failures
+        ),
+    )
+
+    synthesis_failed: str | None = None
+    try:
+        synthesis_text, ctx.muninn_history = await run_and_stream(
+            ctx.muninn_agent,
+            synthesis_prompt,
+            syn_md,
+            message_history=ctx.muninn_history,
+            log=ctx.log,
+            model_settings=ctx.model_settings,
+            label="muninn-prd-synthesis",
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        synthesis_failed = type(exc).__name__
+        synthesis_text = (
+            f"_Synthesis failed: {synthesis_failed}: {exc}. Lens outputs "
+            f"and Q&A preserved verbatim below for manual review._"
+        )
+        ctx.log({"type": "prd_synthesis_failed",
+                 "exc": synthesis_failed, "msg": str(exc)})
+
+    # Step 5: Save artifact.
+    await ctx.mount_muninn_md("🐦‍⬛ **Muninn · step 5/5 · saving artifact**")
+    slug = _slug_for_path(ctx.description)
+    path = _unique_artifact_path(ctx.cwd, "prds", slug)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = _artifact_body(
+        flow_kind="prd",
+        description=ctx.description,
+        today=date.today(),
+        synthesis_text=synthesis_text,
+        lens_order=PRD_LENSES,
+        lens_results=lens_results,
+        lens_failures=lens_failures,
+        qa_summary=qa_summary,
+    )
+    path.write_text(body, encoding="utf-8")
+    rel = str(path.relative_to(ctx.cwd))
+
+    summary: dict[str, Any] = {
+        "type": "prd_partial" if synthesis_failed else "prd_complete",
+        "description": ctx.description,
+        "artifact_path": rel,
+        "synthesis_len": len(synthesis_text),
+        "lens_outputs": {lens: len(lens_results.get(lens, ""))
+                         for lens in PRD_LENSES},
+        "lens_failures": dict(lens_failures),
+        "successful_lens_count": len(lens_results),
+        "failed_lens_count": len(lens_failures),
+    }
+    if synthesis_failed:
+        summary["synthesis_failed"] = synthesis_failed
+        await ctx.mount_muninn_md(
+            f"⚠️ **/prd partial** · synthesis failed "
+            f"({synthesis_failed}); lens outputs saved to {rel}"
+        )
+    else:
+        await ctx.mount_muninn_md(
+            f"✅ **/prd complete** · _{len(lens_results)} lens(es) · "
+            f"synthesis {len(synthesis_text)}b · saved to {rel}_"
+        )
+    ctx.log(summary)
     return summary
 
 

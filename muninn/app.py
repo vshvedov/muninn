@@ -85,12 +85,28 @@ from .streaming import run_and_stream
 from .themes import ALL_THEMES, DEFAULT_THEME_NAME
 from .tools import ToolContext, ToolError, make_tools
 from .workflows import (
+    BRAINSTORM_LENSES,
+    PRD_LENSES,
+    BrainstormRunCtx,
     BugRunCtx,
     FeatureRunCtx,
+    PRDRunCtx,
     ReviewRunCtx,
+    brainstorm_flow,
     bug_flow,
     feature_flow,
+    prd_flow,
     precommit_review_flow,
+)
+
+
+# Worker groups cancelled on Esc / action_cancel_workers. Module-level
+# constant so tests can import + assert membership without source AST
+# inspection. Order is informational; cancellation is set-semantic.
+_CANCEL_GROUPS: tuple[str, ...] = (
+    "muninn", "feature", "bug", "review",
+    "brainstorm", "prd",
+    "huginn", "pull",
 )
 
 
@@ -139,13 +155,18 @@ run shell, ask you a question) and uses them when helpful. This is the
 normal LLM-as-coding-assistant mode - no Huginn review.
 
 **Slash commands** activate the elephant/goldfish pattern. Muninn drafts
-the artifact; a fresh stateless **Huginn** cold-reads it for blind spots;
-Muninn revises; cycle repeats until Huginn signs off (or you choose to
-proceed / cancel from the modal). Three commands ship in Phase 1:
+the artifact; one or more fresh stateless **Huginns** cold-read it for
+blind spots; Muninn revises (or synthesizes, for ideation flows); cycle
+repeats until Huginn signs off (or you choose to proceed / cancel from
+the modal). Five commands ship:
 
 - `/feature <description>` - design a new feature, get cold-read, implement
 - `/bug <symptom>` - diagnose a bug, write a failing test, fix it
 - `/precommit-review` - cold-read pending diff with stack-aware local checks
+- `/brainstorm <rough idea>` - 3 lens cold-reads (tech/contrarian/UX),
+  synthesize, save to `docs/brainstorms/`
+- `/prd <idea>` - structured Q&A, 3 research lenses
+  (prior-art/edge-cases/integration), synthesize, save to `docs/prds/`
 
 **Keys:**
 - `Ctrl+P` palette: model / freedom / num_ctx / max revisions / theme
@@ -166,9 +187,13 @@ SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/feature", "design doc · cold-read · revise · implement"),
     ("/bug", "ground · problem doc · cold-read · failing test · fix"),
     ("/precommit-review", "diff + stack-aware local checks + Huginn cold-read"),
+    ("/brainstorm", "ground · 3 lens cold-reads · synthesis · save to docs/brainstorms/"),
+    ("/prd", "ground · structured Q&A · 3 research lenses · synthesis · save to docs/prds/"),
 ]
 
-_COMMANDS_TAKING_ARG: frozenset[str] = frozenset({"/feature", "/bug"})
+_COMMANDS_TAKING_ARG: frozenset[str] = frozenset({
+    "/feature", "/bug", "/brainstorm", "/prd",
+})
 
 
 def _slash_candidates(state: TargetState) -> list[DropdownItem]:
@@ -814,7 +839,7 @@ class MuninnTUI(App):
         self.freedom_level = order[(order.index(cur) + 1) % len(order)]
 
     def action_cancel_workers(self) -> None:
-        for group in ("muninn", "feature", "bug", "review", "huginn", "pull"):
+        for group in _CANCEL_GROUPS:
             self.workers.cancel_group(self, group)
         self._log({"type": "user_cancel"})
         try:
@@ -873,12 +898,25 @@ class MuninnTUI(App):
                 await self._echo_md("_/bug requires a description of the bug._")
                 return
             self._run_bug_worker(description)
+        elif text.startswith("/brainstorm"):
+            description = text[len("/brainstorm"):].strip()
+            if not description:
+                await self._echo_md("_/brainstorm requires a rough idea._")
+                return
+            self._run_brainstorm_worker(description)
+        elif text.startswith("/prd"):
+            description = text[len("/prd"):].strip()
+            if not description:
+                await self._echo_md("_/prd requires an idea description._")
+                return
+            self._run_prd_worker(description)
         elif text.startswith("/precommit-review"):
             self._run_review_worker()
         elif text.startswith("/"):
+            available = ", ".join(f"`{c}`" for c, _ in SLASH_COMMANDS)
             await self._echo_md(
                 f"Unknown slash command `{text.split()[0]}`. "
-                f"Phase 1 supports `/feature`, `/bug`, `/precommit-review`."
+                f"Available: {available}."
             )
         else:
             self._run_chat_worker(text)
@@ -1030,6 +1068,128 @@ class MuninnTUI(App):
         except Exception as e:
             await self._echo_md(f"**/bug failed:** {type(e).__name__}: {e}")
             self._log({"type": "bug_failed", "error": str(e), "exc": type(e).__name__})
+
+    @work(group="brainstorm", exclusive=True)
+    async def _run_brainstorm_worker(self, description: str) -> None:
+        async def mount_muninn(header: str) -> Markdown:
+            return await self._new_streaming_md(header, pane="muninn")
+
+        async def mount_huginn(header: str) -> Markdown:
+            return await self._new_streaming_md(header, pane="huginn")
+
+        ctx = BrainstormRunCtx(
+            description=description,
+            cwd=self.cwd,
+            muninn_agent=self.muninn_agent,
+            huginn_agent_factory=self.huginn_factory,
+            muninn_history=self.muninn_history,
+            brainstorm_ground_prompt=bootstrap.load_prompt(self.muninn_dir, "brainstorm_ground"),
+            brainstorm_lens_prompts={
+                lens: bootstrap.load_prompt(self.muninn_dir, f"brainstorm_lens_{lens}")
+                for lens in BRAINSTORM_LENSES
+            },
+            brainstorm_synthesis_prompt=bootstrap.load_prompt(self.muninn_dir, "brainstorm_synthesis"),
+            model_settings=num_ctx_settings(int(self.config["num_ctx"])),
+            log=self._log,
+            mount_muninn_md=mount_muninn,
+            mount_huginn_md=mount_huginn,
+        )
+        try:
+            summary = await brainstorm_flow(ctx)
+            self.muninn_history = ctx.muninn_history
+            if summary["type"] == "brainstorm_complete":
+                # Use the workflow's actual successful_lens_count, not the
+                # hardcoded BRAINSTORM_LENSES tuple length - on partial-success
+                # those numbers diverge.
+                ok = summary["successful_lens_count"]
+                bad = summary["failed_lens_count"]
+                tail = (
+                    f" · {bad} lens(es) failed: "
+                    + ", ".join(f"{l}={c}" for l, c in summary["lens_failures"].items())
+                ) if bad else ""
+                await self._echo_md(
+                    f"**Brainstorm complete.** _{ok} lens(es) · "
+                    f"synthesis {summary['synthesis_len']}b · "
+                    f"saved to {summary['artifact_path']}{tail}_"
+                )
+            elif summary["type"] == "brainstorm_partial":
+                await self._echo_md(
+                    f"**Brainstorm partial.** _synthesis failed "
+                    f"({summary['synthesis_failed']}); lens outputs saved to "
+                    f"{summary['artifact_path']}_"
+                )
+            else:
+                await self._echo_md(f"**/brainstorm aborted:** {summary['reason']}")
+        except asyncio.CancelledError:
+            await self._echo_md("[/brainstorm cancelled]")
+            raise
+        except ToolError as e:
+            await self._echo_md(f"**/brainstorm aborted at tool:** {e}")
+            self._log({"type": "brainstorm_aborted_tool", "error": str(e)})
+        except Exception as e:
+            await self._echo_md(f"**/brainstorm failed:** {type(e).__name__}: {e}")
+            self._log({"type": "brainstorm_failed",
+                       "error": str(e), "exc": type(e).__name__})
+
+    @work(group="prd", exclusive=True)
+    async def _run_prd_worker(self, description: str) -> None:
+        async def mount_muninn(header: str) -> Markdown:
+            return await self._new_streaming_md(header, pane="muninn")
+
+        async def mount_huginn(header: str) -> Markdown:
+            return await self._new_streaming_md(header, pane="huginn")
+
+        ctx = PRDRunCtx(
+            description=description,
+            cwd=self.cwd,
+            muninn_agent=self.muninn_agent,
+            huginn_agent_factory=self.huginn_factory,
+            muninn_history=self.muninn_history,
+            prd_ground_prompt=bootstrap.load_prompt(self.muninn_dir, "prd_ground"),
+            prd_qa_prompt=bootstrap.load_prompt(self.muninn_dir, "prd_qa"),
+            prd_lens_prompts={
+                lens: bootstrap.load_prompt(self.muninn_dir, f"prd_lens_{lens}")
+                for lens in PRD_LENSES
+            },
+            prd_synthesis_prompt=bootstrap.load_prompt(self.muninn_dir, "prd_synthesis"),
+            model_settings=num_ctx_settings(int(self.config["num_ctx"])),
+            log=self._log,
+            mount_muninn_md=mount_muninn,
+            mount_huginn_md=mount_huginn,
+        )
+        try:
+            summary = await prd_flow(ctx)
+            self.muninn_history = ctx.muninn_history
+            if summary["type"] == "prd_complete":
+                ok = summary["successful_lens_count"]
+                bad = summary["failed_lens_count"]
+                tail = (
+                    f" · {bad} lens(es) failed: "
+                    + ", ".join(f"{l}={c}" for l, c in summary["lens_failures"].items())
+                ) if bad else ""
+                await self._echo_md(
+                    f"**PRD complete.** _{ok} research lens(es) · "
+                    f"synthesis {summary['synthesis_len']}b · "
+                    f"saved to {summary['artifact_path']}{tail}_"
+                )
+            elif summary["type"] == "prd_partial":
+                await self._echo_md(
+                    f"**PRD partial.** _synthesis failed "
+                    f"({summary['synthesis_failed']}); lens outputs and Q&A "
+                    f"saved to {summary['artifact_path']}_"
+                )
+            else:
+                await self._echo_md(f"**/prd aborted:** {summary['reason']}")
+        except asyncio.CancelledError:
+            await self._echo_md("[/prd cancelled]")
+            raise
+        except ToolError as e:
+            await self._echo_md(f"**/prd aborted at tool:** {e}")
+            self._log({"type": "prd_aborted_tool", "error": str(e)})
+        except Exception as e:
+            await self._echo_md(f"**/prd failed:** {type(e).__name__}: {e}")
+            self._log({"type": "prd_failed",
+                       "error": str(e), "exc": type(e).__name__})
 
     @work(group="review", exclusive=True)
     async def _run_review_worker(self) -> None:

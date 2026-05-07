@@ -19,6 +19,17 @@ def test_project_bootstrap_creates_expected_files(tmp_path: Path, monkeypatch) -
     assert "bug_problem" in bootstrap.PROMPT_NAMES
     assert "bug_critique" in bootstrap.PROMPT_NAMES
     assert "precommit_review" in bootstrap.PROMPT_NAMES
+    # /brainstorm + /prd prompts shipped alongside /feature and /bug.
+    for name in (
+        "brainstorm_ground",
+        "brainstorm_lens_technical", "brainstorm_lens_contrarian",
+        "brainstorm_lens_ux", "brainstorm_synthesis",
+        "prd_ground", "prd_qa",
+        "prd_lens_prior_art", "prd_lens_edge_cases", "prd_lens_integration",
+        "prd_synthesis",
+    ):
+        assert name in bootstrap.PROMPT_NAMES, f"{name} missing from PROMPT_NAMES"
+        assert name in bootstrap._BUNDLED_PROMPTS, f"{name} missing bundled body"
     assert (md / "logs").is_dir()
     # history/ was removed: Phase 2 resume will reconstruct from the JSONL log.
     assert not (md / "history").exists()
@@ -274,3 +285,77 @@ def test_freedom_level_presets_shape() -> None:
         assert isinstance(value, str)
         assert isinstance(label, str) and label
         assert isinstance(desc, str) and len(desc) > 20
+
+
+# Placeholder map: every prompt name -> dict of dummy kwargs that .format()
+# must accept without KeyError. Mirrors the contract documented in
+# workflows.py and the design doc's "Prompt registry" section. Adding a
+# new prompt to PROMPT_NAMES without adding its placeholder set here is a
+# guaranteed test failure - intentional canary.
+_PLACEHOLDER_KWARGS: dict[str, dict[str, str]] = {
+    # core
+    "muninn": {},
+    "huginn": {},
+    # /feature
+    "feature_ground": {"description": "x"},
+    "feature_design": {"description": "x"},
+    "feature_comprehension": {"design_doc": "x"},
+    "feature_critique": {"design_doc": "x"},
+    "feature_readiness": {"design_doc": "x"},
+    # /bug
+    "bug_ground": {"description": "x"},
+    "bug_problem": {"description": "x"},
+    "bug_critique": {"problem_doc": "x"},
+    # /precommit-review
+    "precommit_review": {"checks": "x", "diff": "x"},
+    # /brainstorm
+    "brainstorm_ground": {"description": "x"},
+    "brainstorm_lens_technical": {"description": "x", "ground_brief": "x"},
+    "brainstorm_lens_contrarian": {"description": "x", "ground_brief": "x"},
+    "brainstorm_lens_ux": {"description": "x", "ground_brief": "x"},
+    "brainstorm_synthesis": {
+        "description": "x", "ground_brief": "x", "lens_outputs": "x",
+    },
+    # /prd
+    "prd_ground": {"description": "x"},
+    "prd_qa": {"description": "x", "ground_brief": "x"},
+    "prd_lens_prior_art": {
+        "description": "x", "ground_brief": "x", "qa_summary": "x",
+    },
+    "prd_lens_edge_cases": {
+        "description": "x", "ground_brief": "x", "qa_summary": "x",
+    },
+    "prd_lens_integration": {
+        "description": "x", "ground_brief": "x", "qa_summary": "x",
+    },
+    "prd_synthesis": {
+        "description": "x", "ground_brief": "x",
+        "qa_summary": "x", "lens_outputs": "x",
+    },
+}
+
+
+def test_every_prompt_name_has_placeholder_kwargs_in_test_map() -> None:
+    """Canary: adding a new prompt to PROMPT_NAMES requires adding its
+    placeholder set to _PLACEHOLDER_KWARGS in this file. Forces tests to
+    stay synced with the registry."""
+    missing = set(bootstrap.PROMPT_NAMES) - set(_PLACEHOLDER_KWARGS.keys())
+    assert not missing, (
+        f"PROMPT_NAMES has entries with no placeholder kwargs in test map: {missing}"
+    )
+
+
+def test_every_prompt_resolves_and_formats_cleanly(tmp_path: Path, monkeypatch) -> None:
+    """Every name in PROMPT_NAMES must (a) resolve to a non-empty string
+    via load_prompt(), and (b) accept the documented placeholder kwargs
+    via .format() without KeyError. Catches typos like {descrption} or
+    a missing placeholder in a freshly-edited bundled prompt."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    md = bootstrap.ensure_muninn_dir(tmp_path)
+    for name in bootstrap.PROMPT_NAMES:
+        body = bootstrap.load_prompt(md, name)
+        assert body, f"prompt {name!r} resolved to empty string"
+        kwargs = _PLACEHOLDER_KWARGS[name]
+        # If the prompt has no placeholders, .format(**{}) is a no-op.
+        # If it has documented ones, they must match.
+        body.format(**kwargs)

@@ -7,14 +7,24 @@ from typing import Any
 from pydantic_ai.settings import ModelSettings
 
 from muninn.workflows import (
+    BRAINSTORM_LENSES,
+    PRD_LENSES,
+    BrainstormRunCtx,
     BugRunCtx,
     FeatureRunCtx,
+    PRDRunCtx,
     ReviewRunCtx,
+    _artifact_body,
+    _format_lens_outputs,
     _has_no_findings,
     _python_syntax_check,
+    _slug_for_path,
+    _unique_artifact_path,
     _verdict,
+    brainstorm_flow,
     bug_flow,
     feature_flow,
+    prd_flow,
     precommit_review_flow,
 )
 
@@ -78,6 +88,16 @@ class _FakeStream:
 class _FakeAgent:
     name: str
     output_text: str
+    # Optional injection knobs added for /brainstorm and /prd tests.
+    # error: when set, raise after yielding one TextPartDelta - simulates
+    #        mid-stream Ollama disconnect.
+    # received_prompts / call_count: per-instance recorders for tests
+    #        that need to verify what the agent saw.
+    error: BaseException | None = None
+
+    def __post_init__(self) -> None:
+        self.received_prompts: list[str] = []
+        self.call_count: int = 0
 
     async def run_stream_events(self, prompt, *, message_history=None, model_settings=None):
         # Yield a few text deltas + a final result event.
@@ -87,8 +107,17 @@ class _FakeAgent:
         )
         from pydantic_ai.run import AgentRunResultEvent
 
-        for chunk in [self.output_text[i:i+20] for i in range(0, len(self.output_text), 20)]:
+        self.received_prompts.append(prompt)
+        self.call_count += 1
+
+        chunks = [self.output_text[i:i+20] for i in range(0, len(self.output_text), 20)] or [""]
+        for i, chunk in enumerate(chunks):
             yield PartDeltaEvent(index=0, delta=TextPartDelta(content_delta=chunk))
+            # Inject mid-stream error after the first delta so tests see
+            # partial output before the failure (matches real Ollama
+            # disconnect behavior).
+            if self.error is not None and i == 0:
+                raise self.error
 
         # Build a minimal result-like object.
         class _R:
@@ -932,3 +961,729 @@ async def test_bug_backstop_asks_at_low(monkeypatch) -> None:
     summary = await bug_flow(ctx)
     assert summary["type"] == "bug_complete"
     assert asked, "low must call ask_user"
+
+
+# =====================================================================
+# /brainstorm and /prd tests
+# =====================================================================
+
+import pytest
+
+
+@pytest.mark.parametrize("desc, expected", [
+    ("hello world", "hello-world"),
+    ("Multiple   Spaces!!!", "multiple-spaces"),
+    ("", "idea"),
+    ("你好", "idea"),                       # non-ASCII stripped -> empty -> 'idea'
+    ("***", "idea"),
+    ("foo--bar--", "foo-bar"),
+    ("a" * 100, "a" * 60),                  # truncated to max_len
+    ("Hello, World - 2026!", "hello-world-2026"),
+])
+def test_slug_for_path_edge_cases(desc, expected) -> None:
+    assert _slug_for_path(desc) == expected
+
+
+def test_slug_for_path_truncate_strips_trailing_dash(tmp_path) -> None:
+    # If truncation lands the cut on a non-alnum boundary, no trailing dash.
+    desc = "a" * 58 + "!!" + "b" * 10
+    out = _slug_for_path(desc, max_len=60)
+    assert not out.endswith("-")
+    assert len(out) <= 60
+
+
+def test_unique_artifact_path_no_collision(tmp_path) -> None:
+    from datetime import datetime
+    fake_now = datetime(2026, 5, 7, 14, 30, 0)
+    p = _unique_artifact_path(tmp_path, "brainstorms", "test-idea", now=fake_now)
+    assert p == tmp_path / "docs" / "brainstorms" / "test-idea-2026-05-07.md"
+    # Helper does NOT create the file or its parents.
+    assert not p.exists()
+    assert not p.parent.exists()
+
+
+def test_unique_artifact_path_collision_falls_back_to_hhmmss(tmp_path) -> None:
+    from datetime import datetime
+    fake_now = datetime(2026, 5, 7, 14, 30, 5)
+    primary_dir = tmp_path / "docs" / "brainstorms"
+    primary_dir.mkdir(parents=True)
+    primary = primary_dir / "test-2026-05-07.md"
+    primary.write_text("existing", encoding="utf-8")
+
+    p = _unique_artifact_path(tmp_path, "brainstorms", "test", now=fake_now)
+    assert p.name == "test-2026-05-07-143005.md"
+
+
+def test_unique_artifact_path_double_collision_raises(tmp_path) -> None:
+    from datetime import datetime
+    import pytest as _pt
+    fake_now = datetime(2026, 5, 7, 14, 30, 5)
+    d = tmp_path / "docs" / "brainstorms"
+    d.mkdir(parents=True)
+    (d / "test-2026-05-07.md").write_text("a", encoding="utf-8")
+    (d / "test-2026-05-07-143005.md").write_text("b", encoding="utf-8")
+    with _pt.raises(FileExistsError):
+        _unique_artifact_path(tmp_path, "brainstorms", "test", now=fake_now)
+
+
+def test_format_lens_outputs_disjoint_invariant() -> None:
+    # results and failures must be disjoint and together cover order.
+    text = _format_lens_outputs(
+        ("a", "b", "c"),
+        results={"a": "alpha", "b": "beta"},
+        failures={"c": "ConnectionError"},
+    )
+    assert "--- LENS: a ---\nalpha\n--- END LENS: a ---" in text
+    assert "--- LENS: b ---\nbeta\n--- END LENS: b ---" in text
+    assert "(lens unavailable: ConnectionError)" in text
+
+
+def test_format_lens_outputs_overlap_assertion() -> None:
+    import pytest as _pt
+    with _pt.raises(AssertionError):
+        _format_lens_outputs(
+            ("a",),
+            results={"a": "x"},
+            failures={"a": "X"},   # overlap is forbidden
+        )
+
+
+def test_format_lens_outputs_missing_lens_assertion() -> None:
+    import pytest as _pt
+    with _pt.raises(AssertionError):
+        _format_lens_outputs(
+            ("a", "b"),
+            results={"a": "x"},
+            failures={},   # 'b' missing from both
+        )
+
+
+def _make_keyed_huginn_factory(
+    lens_order: tuple[str, ...],
+    outputs: dict[str, str] | None = None,
+    errors: dict[str, BaseException] | None = None,
+):
+    """Test helper: factory returns _FakeAgent instances keyed by call index
+    into lens_order. Outputs and errors are looked up by lens name; missing
+    keys default to a generic output / no error.
+
+    Pattern: workflows._fan_out_lenses calls factory() in lens_order tuple
+    sequence (Step 1 sequential mint), so call N corresponds to lens_order[N].
+
+    Returns (factory, agents) where agents is a list mutated as instances
+    are minted - tests can inspect them after the flow.
+    """
+    outputs = outputs or {}
+    errors = errors or {}
+    counter = [0]
+    agents: list[_FakeAgent] = []
+
+    def factory():
+        idx = counter[0]
+        counter[0] += 1
+        if idx >= len(lens_order):
+            # Defensive: extra calls return a benign agent.
+            agent = _FakeAgent(f"huginn-extra-{idx}", "extra")
+        else:
+            lens = lens_order[idx]
+            agent = _FakeAgent(
+                f"huginn-{lens}",
+                outputs.get(lens, f"{lens} lens output"),
+                error=errors.get(lens),
+            )
+        agents.append(agent)
+        return agent
+
+    return factory, agents
+
+
+# ---- /brainstorm ----------------------------------------------------
+
+def _brainstorm_test_prompts() -> dict:
+    """Minimal valid prompt strings for tests; placeholders are mandatory."""
+    return {
+        "ground": "ground: {description}",
+        "lens": {
+            lens: f"lens-{lens}: {{description}} :: {{ground_brief}}"
+            for lens in BRAINSTORM_LENSES
+        },
+        "synth": (
+            "synth: {description} :: {ground_brief} :: {lens_outputs}"
+        ),
+    }
+
+
+async def test_brainstorm_flow_writes_artifact(tmp_path, monkeypatch) -> None:
+    from textual.widgets import Markdown
+    monkeypatch.setattr(Markdown, "get_stream",
+                        classmethod(lambda cls, md: _FakeStream(md)))
+
+    log_records: list[dict] = []
+
+    async def mount_md(_h):
+        return _FakeMd()
+
+    muninn = _FakeAgent("muninn", "GROUND BRIEF... ## Brief done.")
+    # Distinct outputs per turn: ground, then synthesis. After ground, we
+    # need to swap muninn.output_text for synthesis. Simpler: chain two
+    # FakeAgents via a mutable holder, but the existing tests show that a
+    # single _FakeAgent reused for sequential calls is fine if the output
+    # is shared. The synthesis can reuse the same string; len asserts are
+    # what matter.
+    muninn.output_text = "BRIEF\n## Brief done.\n--SEP--\nSYNTHESIS\nrecommended next: /prd"
+
+    prompts = _brainstorm_test_prompts()
+    factory, _agents = _make_keyed_huginn_factory(
+        BRAINSTORM_LENSES,
+        outputs={
+            "technical": "TECH OUTPUT",
+            "contrarian": "CONTRA OUTPUT",
+            "ux": "UX OUTPUT",
+        },
+    )
+
+    ctx = BrainstormRunCtx(
+        description="test idea",
+        cwd=tmp_path,
+        muninn_agent=muninn,
+        huginn_agent_factory=factory,
+        muninn_history=[],
+        brainstorm_ground_prompt=prompts["ground"],
+        brainstorm_lens_prompts=prompts["lens"],
+        brainstorm_synthesis_prompt=prompts["synth"],
+        model_settings=ModelSettings(),
+        log=log_records.append,
+        mount_muninn_md=mount_md,
+        mount_huginn_md=mount_md,
+    )
+    summary = await brainstorm_flow(ctx)
+
+    assert summary["type"] == "brainstorm_complete"
+    assert summary["description"] == "test idea"
+    assert summary["artifact_path"].startswith("docs/brainstorms/test-idea-")
+    assert summary["artifact_path"].endswith(".md")
+    assert summary["lens_failures"] == {}
+    assert set(summary["lens_outputs"].keys()) == set(BRAINSTORM_LENSES)
+    # Artifact actually written and contains all lens outputs.
+    art = (tmp_path / summary["artifact_path"]).read_text(encoding="utf-8")
+    assert "# Brainstorm: test idea" in art
+    assert "TECH OUTPUT" in art
+    assert "CONTRA OUTPUT" in art
+    assert "UX OUTPUT" in art
+    # JSONL events for each lens.
+    types = [r.get("type") for r in log_records]
+    assert "brainstorm_started" in types
+    assert types.count("lens_started") == 3
+    assert types.count("lens_completed") == 3
+    assert "brainstorm_synthesizing" in types
+    assert "brainstorm_complete" in types
+
+
+async def test_brainstorm_flow_one_lens_fails(tmp_path, monkeypatch) -> None:
+    from textual.widgets import Markdown
+    monkeypatch.setattr(Markdown, "get_stream",
+                        classmethod(lambda cls, md: _FakeStream(md)))
+
+    async def mount_md(_h):
+        return _FakeMd()
+
+    log_records: list[dict] = []
+    muninn = _FakeAgent("muninn", "ground brief\n## Brief done.")
+
+    prompts = _brainstorm_test_prompts()
+    factory, _agents = _make_keyed_huginn_factory(
+        BRAINSTORM_LENSES,
+        outputs={"technical": "TECH", "ux": "UX"},
+        errors={"contrarian": ConnectionError("ollama dead mid-stream")},
+    )
+
+    ctx = BrainstormRunCtx(
+        description="failing-lens-test",
+        cwd=tmp_path,
+        muninn_agent=muninn,
+        huginn_agent_factory=factory,
+        muninn_history=[],
+        brainstorm_ground_prompt=prompts["ground"],
+        brainstorm_lens_prompts=prompts["lens"],
+        brainstorm_synthesis_prompt=prompts["synth"],
+        model_settings=ModelSettings(),
+        log=log_records.append,
+        mount_muninn_md=mount_md,
+        mount_huginn_md=mount_md,
+    )
+    summary = await brainstorm_flow(ctx)
+
+    # Synthesis still runs (>=1 lens succeeded); artifact written.
+    assert summary["type"] == "brainstorm_complete"
+    assert summary["lens_failures"] == {"contrarian": "ConnectionError"}
+    art = (tmp_path / summary["artifact_path"]).read_text(encoding="utf-8")
+    assert "(lens unavailable: ConnectionError)" in art
+    assert "TECH" in art and "UX" in art
+    # Synthesis prompt saw the unavailable placeholder.
+    synth_prompts = [p for p in muninn.received_prompts
+                     if "synth:" in p and "lens_outputs" not in p]
+    assert any("(lens unavailable: ConnectionError)" in p
+               for p in muninn.received_prompts)
+    assert any("--- LENS: contrarian ---" in p for p in muninn.received_prompts)
+
+
+async def test_brainstorm_flow_all_lenses_fail(tmp_path, monkeypatch) -> None:
+    from textual.widgets import Markdown
+    monkeypatch.setattr(Markdown, "get_stream",
+                        classmethod(lambda cls, md: _FakeStream(md)))
+
+    async def mount_md(_h):
+        return _FakeMd()
+
+    log_records: list[dict] = []
+    muninn = _FakeAgent("muninn", "ground brief\n## Brief done.")
+
+    prompts = _brainstorm_test_prompts()
+    factory, _agents = _make_keyed_huginn_factory(
+        BRAINSTORM_LENSES,
+        errors={
+            lens: ConnectionError(f"{lens} dead") for lens in BRAINSTORM_LENSES
+        },
+    )
+
+    ctx = BrainstormRunCtx(
+        description="all-fail",
+        cwd=tmp_path,
+        muninn_agent=muninn,
+        huginn_agent_factory=factory,
+        muninn_history=[],
+        brainstorm_ground_prompt=prompts["ground"],
+        brainstorm_lens_prompts=prompts["lens"],
+        brainstorm_synthesis_prompt=prompts["synth"],
+        model_settings=ModelSettings(),
+        log=log_records.append,
+        mount_muninn_md=mount_md,
+        mount_huginn_md=mount_md,
+    )
+    summary = await brainstorm_flow(ctx)
+
+    assert summary["type"] == "brainstorm_failed"
+    assert "all 3 lenses failed" in summary["reason"]
+    assert summary["lens_failures"] == {
+        lens: "ConnectionError" for lens in BRAINSTORM_LENSES
+    }
+    # NO artifact written.
+    brainstorms_dir = tmp_path / "docs" / "brainstorms"
+    assert not brainstorms_dir.exists() or not list(brainstorms_dir.glob("*.md"))
+    # Synthesis NOT called (muninn.call_count == 1: only ground).
+    assert muninn.call_count == 1, (
+        f"synthesis must not run when all lenses fail; "
+        f"muninn.call_count={muninn.call_count}"
+    )
+
+
+# ---- /prd ----------------------------------------------------------
+
+def _prd_test_prompts() -> dict:
+    return {
+        "ground": "prd-ground: {description}",
+        "qa": "prd-qa: {description} :: {ground_brief}",
+        "lens": {
+            lens: f"prd-lens-{lens}: {{description}} :: {{ground_brief}} :: {{qa_summary}}"
+            for lens in PRD_LENSES
+        },
+        "synth": "prd-synth: {description} :: {ground_brief} :: {qa_summary} :: {lens_outputs}",
+    }
+
+
+async def test_prd_flow_writes_artifact_with_qa(tmp_path, monkeypatch) -> None:
+    from textual.widgets import Markdown
+    monkeypatch.setattr(Markdown, "get_stream",
+                        classmethod(lambda cls, md: _FakeStream(md)))
+
+    async def mount_md(_h):
+        return _FakeMd()
+
+    log_records: list[dict] = []
+    muninn = _FakeAgent(
+        "muninn",
+        # Ground turn output (only the first call uses this; we don't
+        # rotate output_text between turns - synthesis call sees the same
+        # text, which is fine for happy-path verification).
+        "ground brief\n## Brief done.\nQ&A summary\n- Q: x\n  A: y\nqa complete",
+    )
+
+    prompts = _prd_test_prompts()
+    factory, _agents = _make_keyed_huginn_factory(
+        PRD_LENSES,
+        outputs={
+            "prior_art": "PRIOR ART",
+            "edge_cases": "EDGE CASES",
+            "integration": "INTEGRATION",
+        },
+    )
+
+    ctx = PRDRunCtx(
+        description="persistent transcript pane",
+        cwd=tmp_path,
+        muninn_agent=muninn,
+        huginn_agent_factory=factory,
+        muninn_history=[],
+        prd_ground_prompt=prompts["ground"],
+        prd_qa_prompt=prompts["qa"],
+        prd_lens_prompts=prompts["lens"],
+        prd_synthesis_prompt=prompts["synth"],
+        model_settings=ModelSettings(),
+        log=log_records.append,
+        mount_muninn_md=mount_md,
+        mount_huginn_md=mount_md,
+    )
+    summary = await prd_flow(ctx)
+
+    assert summary["type"] == "prd_complete"
+    assert summary["artifact_path"].startswith("docs/prds/persistent-transcript-pane-")
+    art = (tmp_path / summary["artifact_path"]).read_text(encoding="utf-8")
+    assert "# PRD: persistent transcript pane" in art
+    assert "## Q&A summary" in art
+    assert "PRIOR ART" in art and "EDGE CASES" in art and "INTEGRATION" in art
+    types = [r.get("type") for r in log_records]
+    assert "prd_started" in types
+    assert "prd_grounded" in types
+    assert "prd_qa_started" in types
+    # qa_complete recognized via "qa complete" tail token.
+    assert any(t in types for t in ("prd_qa_complete", "prd_qa_no_token")), types
+    assert "prd_synthesizing" in types
+    assert "prd_complete" in types
+
+
+async def test_prd_flow_zero_questions(tmp_path, monkeypatch) -> None:
+    from textual.widgets import Markdown
+    monkeypatch.setattr(Markdown, "get_stream",
+                        classmethod(lambda cls, md: _FakeStream(md)))
+
+    async def mount_md(_h):
+        return _FakeMd()
+
+    log_records: list[dict] = []
+    muninn = _FakeAgent(
+        "muninn",
+        "ground brief\n## Brief done.\nno clarifications gathered",
+    )
+
+    prompts = _prd_test_prompts()
+    factory, _agents = _make_keyed_huginn_factory(PRD_LENSES)
+
+    ctx = PRDRunCtx(
+        description="trivial-prd",
+        cwd=tmp_path,
+        muninn_agent=muninn,
+        huginn_agent_factory=factory,
+        muninn_history=[],
+        prd_ground_prompt=prompts["ground"],
+        prd_qa_prompt=prompts["qa"],
+        prd_lens_prompts=prompts["lens"],
+        prd_synthesis_prompt=prompts["synth"],
+        model_settings=ModelSettings(),
+        log=log_records.append,
+        mount_muninn_md=mount_md,
+        mount_huginn_md=mount_md,
+    )
+    summary = await prd_flow(ctx)
+
+    assert summary["type"] == "prd_complete"
+    types = [r.get("type") for r in log_records]
+    assert "prd_qa_skipped" in types, (
+        f"expected prd_qa_skipped in events; got {types}"
+    )
+    art = (tmp_path / summary["artifact_path"]).read_text(encoding="utf-8")
+    assert "no clarifications gathered" in art
+
+
+# ---- artifact body ------------------------------------------------
+
+def test_artifact_body_brainstorm_full() -> None:
+    from datetime import date
+    body = _artifact_body(
+        flow_kind="brainstorm",
+        description="test idea",
+        today=date(2026, 5, 7),
+        synthesis_text="The synthesis.",
+        lens_order=("technical", "contrarian", "ux"),
+        lens_results={"technical": "tech-out", "ux": "ux-out"},
+        lens_failures={"contrarian": "ConnectionError"},
+    )
+    assert body.startswith("# Brainstorm: test idea\n")
+    assert "Generated 2026-05-07 by `/brainstorm`." in body
+    assert "## Synthesis" in body
+    assert "tech-out" in body
+    assert "(lens unavailable: ConnectionError)" in body
+
+
+def test_artifact_body_prd_includes_qa() -> None:
+    from datetime import date
+    body = _artifact_body(
+        flow_kind="prd",
+        description="some prd",
+        today=date(2026, 5, 7),
+        synthesis_text="THE PRD",
+        lens_order=PRD_LENSES,
+        lens_results={lens: f"out-{lens}" for lens in PRD_LENSES},
+        lens_failures={},
+        qa_summary="- Q: a\n  A: b\nqa complete",
+    )
+    assert "# PRD: some prd" in body
+    assert "## Q&A summary" in body
+    assert "- Q: a" in body
+
+
+# ---- partial-synthesis recovery (synthesis raises but lenses succeeded) ----
+
+class _SequencedFakeAgent(_FakeAgent):
+    """Variant of _FakeAgent that switches output (and optionally raises)
+    based on call_count. Used for tests that need the same agent reference
+    to behave differently across the ground/synthesis turns of a flow.
+
+    `outputs` is a list indexed by call_count (1-based after the first call
+    increment). `errors_by_call` maps call_count -> exception to raise
+    after the first delta of that call.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        outputs: list[str],
+        errors_by_call: dict[int, BaseException] | None = None,
+    ) -> None:
+        super().__init__(name=name, output_text=outputs[0] if outputs else "")
+        self._outputs = outputs
+        self._errors_by_call = errors_by_call or {}
+
+    async def run_stream_events(self, prompt, *, message_history=None, model_settings=None):
+        # Pick the output for this call BEFORE incrementing call_count
+        # (parent's __post_init__ initializes call_count to 0).
+        idx = self.call_count
+        if idx < len(self._outputs):
+            self.output_text = self._outputs[idx]
+        # Switch error injection per-call.
+        # call_count is incremented INSIDE parent's run_stream_events;
+        # _errors_by_call uses 0-based indexing matching the call we're
+        # about to make.
+        self.error = self._errors_by_call.get(idx)
+        async for ev in super().run_stream_events(
+            prompt, message_history=message_history, model_settings=model_settings,
+        ):
+            yield ev
+
+
+async def test_brainstorm_flow_synthesis_fails_lens_outputs_preserved(
+    tmp_path, monkeypatch,
+) -> None:
+    """When synthesis raises mid-stream but lenses succeeded, the flow
+    returns brainstorm_partial AND the artifact still gets written with
+    lens outputs preserved. Covers the synthesis-recovery fallback path
+    that was specified in design-doc gap K but had no test coverage."""
+    from textual.widgets import Markdown
+    monkeypatch.setattr(Markdown, "get_stream",
+                        classmethod(lambda cls, md: _FakeStream(md)))
+
+    async def mount_md(_h):
+        return _FakeMd()
+
+    log_records: list[dict] = []
+    # Muninn: call 0 = ground (success), call 1 = synthesis (raises).
+    muninn = _SequencedFakeAgent(
+        "muninn",
+        outputs=["ground brief\n## Brief done.", "partial synthesis text"],
+        errors_by_call={1: ConnectionError("ollama died during synthesis")},
+    )
+
+    prompts = _brainstorm_test_prompts()
+    factory, _agents = _make_keyed_huginn_factory(
+        BRAINSTORM_LENSES,
+        outputs={"technical": "TECH", "contrarian": "CONTRA", "ux": "UX"},
+    )
+
+    ctx = BrainstormRunCtx(
+        description="synthesis-fail-test",
+        cwd=tmp_path,
+        muninn_agent=muninn,
+        huginn_agent_factory=factory,
+        muninn_history=[],
+        brainstorm_ground_prompt=prompts["ground"],
+        brainstorm_lens_prompts=prompts["lens"],
+        brainstorm_synthesis_prompt=prompts["synth"],
+        model_settings=ModelSettings(),
+        log=log_records.append,
+        mount_muninn_md=mount_md,
+        mount_huginn_md=mount_md,
+    )
+    summary = await brainstorm_flow(ctx)
+
+    assert summary["type"] == "brainstorm_partial"
+    assert summary["synthesis_failed"] == "ConnectionError"
+    # Artifact still written, with lens outputs and the failure marker.
+    art = (tmp_path / summary["artifact_path"]).read_text(encoding="utf-8")
+    assert "_Synthesis failed: ConnectionError" in art
+    assert "TECH" in art and "CONTRA" in art and "UX" in art
+    types = [r.get("type") for r in log_records]
+    assert "brainstorm_synthesis_failed" in types
+    assert "brainstorm_complete" not in types
+
+
+# ---- cancellation propagation through _fan_out_lenses --------------
+
+async def test_prd_flow_all_lenses_fail(tmp_path, monkeypatch) -> None:
+    """PRD twin of test_brainstorm_flow_all_lenses_fail. When all 3 PRD
+    research lenses fail, synthesis must NOT run and no artifact must be
+    written. Catches a regression that breaks only the PRD copy of the
+    all-fail short-circuit."""
+    from textual.widgets import Markdown
+    monkeypatch.setattr(Markdown, "get_stream",
+                        classmethod(lambda cls, md: _FakeStream(md)))
+
+    async def mount_md(_h):
+        return _FakeMd()
+
+    log_records: list[dict] = []
+    # Muninn output covers ground (call 0) and would-be QA (call 1).
+    # Synthesis (call 2) must NOT happen.
+    muninn = _FakeAgent(
+        "muninn", "ground brief\n## Brief done.\n\n## Q&A summary\nqa complete",
+    )
+
+    prompts = _prd_test_prompts()
+    factory, _agents = _make_keyed_huginn_factory(
+        PRD_LENSES,
+        errors={lens: ConnectionError(f"{lens} dead") for lens in PRD_LENSES},
+    )
+
+    ctx = PRDRunCtx(
+        description="prd-all-fail",
+        cwd=tmp_path,
+        muninn_agent=muninn,
+        huginn_agent_factory=factory,
+        muninn_history=[],
+        prd_ground_prompt=prompts["ground"],
+        prd_qa_prompt=prompts["qa"],
+        prd_lens_prompts=prompts["lens"],
+        prd_synthesis_prompt=prompts["synth"],
+        model_settings=ModelSettings(),
+        log=log_records.append,
+        mount_muninn_md=mount_md,
+        mount_huginn_md=mount_md,
+    )
+    summary = await prd_flow(ctx)
+
+    assert summary["type"] == "prd_failed"
+    assert "all 3 lenses failed" in summary["reason"]
+    # NO artifact written.
+    prds_dir = tmp_path / "docs" / "prds"
+    assert not prds_dir.exists() or not list(prds_dir.glob("*.md"))
+    # Muninn called exactly twice: ground + QA. Synthesis must NOT run.
+    assert muninn.call_count == 2, (
+        f"synthesis must not run when all PRD lenses fail; "
+        f"muninn.call_count={muninn.call_count}"
+    )
+
+
+async def test_prd_flow_synthesis_fails_lens_outputs_preserved(
+    tmp_path, monkeypatch,
+) -> None:
+    """PRD twin of test_brainstorm_flow_synthesis_fails_lens_outputs_preserved.
+    Synthesis raises mid-stream; flow returns prd_partial; artifact still
+    written with Q&A + lens outputs + the failure marker."""
+    from textual.widgets import Markdown
+    monkeypatch.setattr(Markdown, "get_stream",
+                        classmethod(lambda cls, md: _FakeStream(md)))
+
+    async def mount_md(_h):
+        return _FakeMd()
+
+    log_records: list[dict] = []
+    # Muninn calls in order: ground (0, ok), qa (1, ok), synthesis (2, raises).
+    muninn = _SequencedFakeAgent(
+        "muninn",
+        outputs=[
+            "ground brief\n## Brief done.",
+            "## Q&A summary\n- Q: x\n  A: y\nqa complete",
+            "partial PRD synthesis text",
+        ],
+        errors_by_call={2: ConnectionError("ollama died during prd synthesis")},
+    )
+
+    prompts = _prd_test_prompts()
+    factory, _agents = _make_keyed_huginn_factory(
+        PRD_LENSES,
+        outputs={
+            "prior_art": "PRIOR_ART_BODY",
+            "edge_cases": "EDGE_CASES_BODY",
+            "integration": "INTEGRATION_BODY",
+        },
+    )
+
+    ctx = PRDRunCtx(
+        description="prd-synthesis-fail",
+        cwd=tmp_path,
+        muninn_agent=muninn,
+        huginn_agent_factory=factory,
+        muninn_history=[],
+        prd_ground_prompt=prompts["ground"],
+        prd_qa_prompt=prompts["qa"],
+        prd_lens_prompts=prompts["lens"],
+        prd_synthesis_prompt=prompts["synth"],
+        model_settings=ModelSettings(),
+        log=log_records.append,
+        mount_muninn_md=mount_md,
+        mount_huginn_md=mount_md,
+    )
+    summary = await prd_flow(ctx)
+
+    assert summary["type"] == "prd_partial"
+    assert summary["synthesis_failed"] == "ConnectionError"
+    art = (tmp_path / summary["artifact_path"]).read_text(encoding="utf-8")
+    assert "_Synthesis failed: ConnectionError" in art
+    assert "## Q&A summary" in art
+    assert "PRIOR_ART_BODY" in art
+    assert "EDGE_CASES_BODY" in art
+    assert "INTEGRATION_BODY" in art
+    types = [r.get("type") for r in log_records]
+    assert "prd_synthesis_failed" in types
+    assert "prd_complete" not in types
+
+
+async def test_fan_out_lenses_propagates_cancelled_error(tmp_path, monkeypatch) -> None:
+    """Esc cancellation must propagate through asyncio.gather. The lens
+    task's `except Exception` (NOT BaseException) lets CancelledError
+    fall through. A future refactor that widens the catch to bare except
+    or BaseException would silently swallow Esc and leave workers
+    half-running - this test is the canary against that.
+    """
+    import asyncio as _asyncio
+    from textual.widgets import Markdown
+    monkeypatch.setattr(Markdown, "get_stream",
+                        classmethod(lambda cls, md: _FakeStream(md)))
+    from muninn.workflows import _fan_out_lenses
+
+    async def mount_md(_h):
+        return _FakeMd()
+
+    log_records: list[dict] = []
+
+    class _CancelOnFirstChunkAgent:
+        async def run_stream_events(self, prompt, *, message_history=None, model_settings=None):
+            from pydantic_ai.messages import PartDeltaEvent, TextPartDelta
+            yield PartDeltaEvent(index=0, delta=TextPartDelta(content_delta="x"))
+            # Simulate the Textual cancel path: Esc triggers
+            # workers.cancel_group, which raises CancelledError into the
+            # awaited stream. The `except Exception` in _fan_out_lenses
+            # MUST let this propagate (CancelledError inherits from
+            # BaseException, not Exception, since Python 3.8).
+            raise _asyncio.CancelledError()
+
+    factory = lambda: _CancelOnFirstChunkAgent()
+
+    with __import__('pytest').raises(_asyncio.CancelledError):
+        await _fan_out_lenses(
+            huginn_agent_factory=factory,
+            lens_prompts={lens: f"prompt-{lens}" for lens in BRAINSTORM_LENSES},
+            lens_order=BRAINSTORM_LENSES,
+            mount_huginn_md=mount_md,
+            log=log_records.append,
+            model_settings=ModelSettings(),
+            flow_label="brainstorm",
+        )
