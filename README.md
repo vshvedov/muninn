@@ -1,10 +1,10 @@
 # 🐦‍⬛ Muninn CLI
 
-<img width="1004" height="674" alt="mununn_cli" src="https://github.com/user-attachments/assets/85d74771-60f9-4165-8bab-6971afa72bfe" />
+<img width="1004" height="674" alt="mununn_cli" src="https://github.com/user-attachments/assets/7cbacd9f-0b1d-4950-b366-0aef2178209a" />
 
 ---
 
-Muninn CLI is an ongoing experiment in building a local AI coding agent with asymmetric context to improve the overall response quality of open-weight models like Qwen, Deepseek and Mistral (only `qwen3-coder` is supported at this time). The idea is based on [e/g workflow](https://github.com/vshvedov/elephant-goldfish) and [the original article](https://drensin.medium.com/elephants-goldfish-and-the-new-golden-age-of-software-engineering-c33641a48874).
+Muninn CLI is an ongoing experiment in building a local AI coding agent with asymmetric context to improve the overall response quality of open-weight models like Qwen, Deepseek and Mistral (only `qwen3-coder` is supported at this time).
 
 ## Overview
 
