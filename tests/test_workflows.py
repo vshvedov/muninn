@@ -820,6 +820,57 @@ async def test_review_flow_runs_huginn_with_diff(tmp_path, monkeypatch) -> None:
     assert any(r.get("type") == "review_verdict" for r in log_records)
 
 
+async def test_review_flow_final_line_does_not_use_success_marker_when_findings_flagged(
+    tmp_path, monkeypatch,
+) -> None:
+    """When Huginn flags findings, the Muninn pane's final summary must NOT
+    carry the green ✅ "complete" marker - that visually contradicts the
+    verdict and makes Muninn look like it ignored the review and stopped.
+    """
+    from textual.widgets import Markdown
+    monkeypatch.setattr(Markdown, "get_stream",
+                        classmethod(lambda cls, md: _FakeStream(md)))
+    _git_init_with_pending_change(tmp_path)
+
+    muninn_headers: list[str] = []
+
+    async def mount_muninn(header: str):
+        muninn_headers.append(header)
+        return _FakeMd()
+
+    async def mount_huginn(_h):
+        return _FakeMd()
+
+    ctx = ReviewRunCtx(
+        cwd=tmp_path,
+        huginn_agent_factory=lambda: _FakeAgent(
+            "h",
+            "1. thing.py:2 missing newline\nWhy: style.\nFix: add newline.\n"
+            "findings flagged",
+        ),
+        review_prompt="checks={checks}\ndiff={diff}",
+        model_settings=ModelSettings(),
+        log=lambda _r: None,
+        mount_muninn_md=mount_muninn,
+        mount_huginn_md=mount_huginn,
+    )
+    summary = await precommit_review_flow(ctx)
+    assert summary["type"] == "review_complete"
+    assert summary["no_findings"] is False
+
+    # The final summary line is the one that mentions the reviewer verdict.
+    finals = [h for h in muninn_headers
+              if "/precommit-review" in h and "reviewer:" in h]
+    assert finals, f"no final summary line in headers: {muninn_headers}"
+    final = finals[-1]
+    assert "findings flagged" in final
+    # The bug: ✅ + "complete" appear regardless of Huginn's verdict.
+    assert "✅" not in final, (
+        "green check on a findings-flagged review reads as success "
+        f"and contradicts the verdict: {final!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # freedom_level backstop short-circuit
 # ---------------------------------------------------------------------------

@@ -2010,8 +2010,14 @@ async def precommit_review_flow(ctx: ReviewRunCtx) -> dict[str, Any]:
     })
 
     fail_count = sum(1 for c in checks if c["status"] == "fail")
+    # When the reviewer flagged findings or any local check failed, the
+    # summary must NOT carry the green check / "complete" - that visually
+    # contradicts the verdict and reads as "Muninn ignored the review".
+    clean = no_findings and fail_count == 0
+    icon = "✅" if clean else "⚠️"
+    status = "complete" if clean else "needs triage"
     final = (
-        f"✅ **/precommit-review complete** · "
+        f"{icon} **/precommit-review {status}** · "
         f"local checks: {fail_count} failed · "
         f"reviewer: {'no findings' if no_findings else 'findings flagged'}"
     )
