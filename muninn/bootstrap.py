@@ -16,9 +16,11 @@ _VALID_LEVELS: frozenset[str] = frozenset({"low", "medium", "high"})
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "schema_version": SCHEMA_VERSION,
-    # qwen3-coder:30b verified to emit OpenAI-compat tool_calls correctly via
-    # Ollama's /v1/chat/completions endpoint. Other tags must be tested with
-    # the curl snippet in SETUP.md before being used here.
+    # qwen3-coder:30b is the default - curl-verified to emit OpenAI-compat
+    # tool_calls correctly via Ollama's /v1/chat/completions endpoint. The
+    # picker also accepts deepseek-r1:* tags (Ollama advertises tools+thinking
+    # capability for the family); other tags must be tested with the curl
+    # snippet in SETUP.md before being used here.
     "model": "qwen3-coder:30b",
     "base_url": "http://localhost:11434/v1",
     # 64K gives comfortable headroom for full e/g flows (ground + design +
@@ -1272,7 +1274,7 @@ If the response contains `tool_calls`, you're good. If the call appears as a
 JSON string inside `content`, that model's chat template doesn't translate
 tool calls properly via the OpenAI-compat layer - pick a different tag.
 
-Known good: `qwen3-coder:30b`.
+Known good: `qwen3-coder:30b`, `deepseek-r1:32b` (Ollama capability tags advertise tools + thinking; curl-verify per the snippet above before relying on it for production work).
 
 ## Files in this directory (per-project)
 

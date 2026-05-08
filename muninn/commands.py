@@ -15,18 +15,27 @@ from .screens import PresetPickerScreen
 _MODEL_TITLE = "model · Ollama tag"
 _MODEL_HELP = (
     "Switch which Ollama tag Muninn / Huginn talk to. Lists pulled tags that "
-    "muninn currently considers compatible (Qwen3-Coder family). To use a "
-    "different tag, pull it then edit `.muninn/config.toml` directly."
+    "muninn currently considers compatible (Qwen3-Coder and DeepSeek-R1 "
+    "families). To use a different tag, pull it then edit "
+    "`.muninn/config.toml` directly."
 )
 
 
 # Compatibility allowlist for the model picker. Only tags whose name starts
-# with one of these prefixes are surfaced in the dropdown. Currently scoped
-# to the Qwen3-Coder family because that is the only family curl-verified
-# to emit OpenAI-compat tool_calls correctly via Ollama's /v1/chat/completions
-# endpoint. Extend the tuple as more models pass the curl-test in SETUP.md.
+# with one of these prefixes are surfaced in the dropdown. The promotion
+# gate is dual: a family is allowlisted if it is EITHER curl-verified
+# locally to emit OpenAI-compat tool_calls via /v1/chat/completions OR
+# Ollama's library page advertises both `tools` and `thinking` capability
+# tags for it. Currently allowlisted:
+#   - qwen3-coder: curl-verified locally.
+#   - deepseek-r1: capability-tag advertised (Ollama library lists
+#     `tools thinking` for every distill 1.5b through 70b plus 671b cloud).
+#     Streaming is the OpenAI-compat default. Users can curl-verify a
+#     specific tag via the snippet in SETUP.md before relying on it.
+# Extend this tuple as more families pass either gate.
 _ALLOWED_MODEL_PREFIXES: tuple[str, ...] = (
     "qwen3-coder",
+    "deepseek-r1",
 )
 
 
@@ -163,7 +172,7 @@ class MuninnSettingsProvider(Provider):
         if not compatible:
             app.notify(
                 "No compatible Ollama models found. Pull `qwen3-coder:30b` "
-                "(or another Qwen3-Coder tag) and retry.",
+                "(or `deepseek-r1:32b`) and retry.",
                 severity="warning", timeout=6,
             )
             return
@@ -186,7 +195,7 @@ class MuninnSettingsProvider(Provider):
             presets.append((name, name, desc))
         screen = PresetPickerScreen(
             title="Set model",
-            subtitle="Compatible Ollama tags pulled locally (Qwen3-Coder family)",
+            subtitle="Compatible Ollama tags pulled locally (Qwen3-Coder and DeepSeek-R1)",
             presets=presets,
             current=current,
         )

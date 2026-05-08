@@ -353,17 +353,122 @@ async def test_ollama_not_installed_detection(tmp_path, monkeypatch):
         assert "Ollama is not installed" in joined
 
 
-async def test_model_picker_allowlist_filters_qwen3_coder_family() -> None:
-    """The model picker only shows Qwen3-Coder family tags."""
+async def test_model_picker_allowlist_supported_families() -> None:
+    """The model picker accepts the Qwen3-Coder and DeepSeek-R1 families."""
     from muninn.commands import _is_allowed_model
+    # Qwen3-Coder family: still accepted.
     assert _is_allowed_model("qwen3-coder:30b") is True
     assert _is_allowed_model("qwen3-coder-next:latest") is True
-    # Known-broken models filtered out.
+    # DeepSeek-R1 family: newly accepted; prefix matches all official
+    # distill sizes plus :latest.
+    assert _is_allowed_model("deepseek-r1:32b") is True
+    assert _is_allowed_model("deepseek-r1:14b") is True
+    assert _is_allowed_model("deepseek-r1:8b") is True
+    assert _is_allowed_model("deepseek-r1:latest") is True
+    # Known-broken / out-of-scope models filtered out.
     assert _is_allowed_model("qwen2.5-coder:32b") is False
     assert _is_allowed_model("hhao/qwen2.5-coder-tools:32b") is False
-    # Unrelated families filtered out (until verified).
-    assert _is_allowed_model("llama3:70b") is False
     assert _is_allowed_model("deepseek-coder:6.7b") is False
+    assert _is_allowed_model("deepseek-coder-v2:16b") is False
+    assert _is_allowed_model("deepseek-v3.1:671b") is False
+    # Third-party namespace (MFDoom/*) NOT matched - prefix anchored.
+    assert _is_allowed_model("MFDoom/deepseek-r1-tool-calling:latest") is False
+    # Unrelated families filtered out.
+    assert _is_allowed_model("llama3:70b") is False
+
+
+async def test_model_picker_lists_deepseek_r1_when_pulled(tmp_path, monkeypatch) -> None:
+    """If both qwen3-coder and deepseek-r1 are pulled, the picker
+    surfaces both as compatible options.
+
+    Plumbing: install the /api/tags mock on the class BEFORE the app is
+    constructed (the boot worker fires on mount). Capture push_screen by
+    replacing the bound method with a recorder that does NOT actually
+    push, so the modal never mounts inside the pilot.
+    """
+    import httpx
+    from muninn import app as app_mod
+    from muninn.commands import MuninnSettingsProvider
+    from muninn.screens import PresetPickerScreen
+
+    bootstrap.ensure_muninn_dir(tmp_path)
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/local/bin/ollama")
+
+    async def _fake_get(self, url, *args, **kwargs):
+        if url.endswith("/api/tags"):
+            return httpx.Response(
+                200,
+                json={"models": [
+                    {"name": "qwen3-coder:30b", "size": 18_556_700_761,
+                     "details": {"family": "qwen3moe",
+                                 "parameter_size": "30.5B",
+                                 "quantization_level": "Q4_K_M"}},
+                    {"name": "deepseek-r1:32b", "size": 20_000_000_000,
+                     "details": {"family": "qwen2",
+                                 "parameter_size": "32.8B",
+                                 "quantization_level": "Q4_K_M"}},
+                ]},
+                request=httpx.Request("GET", url),
+            )
+        return httpx.Response(
+            200, json={}, request=httpx.Request("GET", url)
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", _fake_get)
+
+    # Stub out _build_agents - same trick as the patched_app fixture.
+    def _stub_build(self):
+        self.muninn_agent = object()
+        self.huginn_factory = lambda: object()
+        from muninn.tools import ToolContext
+        self.tool_ctx = ToolContext(
+            cwd=self.cwd, muninn_dir=self.muninn_dir,
+            freedom_level=self.freedom_level,
+            confirm_callback=lambda *a, **k: None,
+            ask_user_callback=lambda *a, **k: None,
+            log=self._log,
+        )
+    monkeypatch.setattr(app_mod.MuninnTUI, "_build_agents", _stub_build)
+
+    a = app_mod.MuninnTUI(cwd=tmp_path)
+    pushed: list[PresetPickerScreen] = []
+
+    async with a.run_test() as pilot:
+        for _ in range(30):
+            await pilot.pause()
+            if a.health_status != "unknown":
+                break
+
+        # Capture-only push_screen: record but do not actually push.
+        def capture(screen, *cap_args, **cap_kwargs):
+            if isinstance(screen, PresetPickerScreen):
+                pushed.append(screen)
+            return None
+        monkeypatch.setattr(a, "push_screen", capture)
+
+        # Bind _fetch_and_show_models to a thin shim that exposes _app -
+        # avoids depending on the Textual Provider constructor signature.
+        # _fetch_and_show_models calls self._make_apply("model") to build
+        # the picker callback, so the shim borrows that too.
+        class _Probe:
+            _app = a
+            _fetch_and_show_models = MuninnSettingsProvider._fetch_and_show_models
+            _make_apply = MuninnSettingsProvider._make_apply
+        probe = _Probe()
+        await _Probe._fetch_and_show_models(probe)
+
+        assert pushed, "model picker did not push a PresetPickerScreen"
+        names = [preset[0] for preset in pushed[0].presets]
+        assert "qwen3-coder:30b" in names
+        assert "deepseek-r1:32b" in names
+
+        # Round-trip the apply closure for the deepseek-r1 preset and
+        # confirm config is updated. Run inside the pilot so app.notify
+        # and the rebuild worker have a live event loop. _build_agents
+        # is stubbed above, so the rebuild worker is a no-op.
+        apply_fn = probe._make_apply("model")
+        apply_fn("deepseek-r1:32b")
+        assert a.config["model"] == "deepseek-r1:32b"
 
 
 async def test_check_not_home_rejects_home(tmp_path, monkeypatch) -> None:
