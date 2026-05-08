@@ -4,7 +4,7 @@
 
 ---
 
-Muninn CLI is an ongoing experiment in building a local AI coding agent with asymmetric context to improve the overall response quality of open-weight models like Qwen, Deepseek and Mistral (only `qwen3-coder` is supported at this time).
+Muninn CLI is an ongoing experiment in building a local AI coding agent with asymmetric context to improve the overall response quality of open-weight models like Qwen, Deepseek and Mistral (`qwen3-coder` and `deepseek-r1` are supported at this time).
 
 ## Overview
 
