@@ -108,7 +108,7 @@ _KIND_COMPREHENSION = _ColdReadKind(
     ready_token="comprehension passed",
     revise_token="comprehension unclear",
     ready_callout="✅ doc reads cleanly",
-    revise_callout="⚠️ doc unclear in places",
+    revise_callout="🚨 doc unclear in places",
     log_kind="comprehension",
 )
 
@@ -123,17 +123,13 @@ _KIND_READINESS = _ColdReadKind(
 
 
 def _verdict_callout(huginn_n: int, verdict: str, kind: _ColdReadKind = _KIND_DIAGNOSIS) -> str:
-    """Markdown for a prominent post-stream verdict line in the Huginn pane.
-
-    Two spaces after the eye glyph so the emoji's variation-selector width
-    doesn't eat the gap before the bold text (matches the in-flight label).
-    """
+    """Markdown for a prominent post-stream verdict line in the Huginn pane."""
     body = (
         kind.ready_callout if verdict == "ready"
         else kind.revise_callout if verdict == "revise"
-        else "⁉️ verdict unparseable"
+        else "❓ verdict unparseable"
     )
-    return f"👁️  **Huginn #{huginn_n} ({kind.label}) says:** {body}"
+    return f"👀 **Huginn #{huginn_n} ({kind.label}) says:** {body}"
 
 
 def _build_revise_prompt(critique_text: str, *, multi_section: bool = False) -> str:
@@ -225,7 +221,7 @@ async def _cold_read_once(
 
     Returns (critique_text, verdict_string).
     """
-    in_flight_header = f"👁️  **Huginn #{huginn_n} ({kind.label}) · thinking…**"
+    in_flight_header = f"👀  **Huginn #{huginn_n} ({kind.label}) · thinking…**"
     huginn_md = await mount_huginn_md(in_flight_header)
     huginn = huginn_agent_factory()
     critique_text, _ = await run_and_stream(
@@ -453,7 +449,7 @@ async def feature_flow(ctx: FeatureRunCtx) -> dict[str, Any]:
     #    produces boilerplate. The grounding output is left in muninn_history
     #    so the design and implementation steps can reference it implicitly.
     ground_md = await ctx.mount_muninn_md(
-        "🐦‍⬛ **Muninn · step 1/4 · grounding**"
+        "🪶 **Muninn · step 1/4 · grounding**"
     )
     ground_prompt = ctx.feature_ground_prompt.format(description=ctx.description)
     ground_text, ctx.muninn_history = await run_and_stream(
@@ -469,7 +465,7 @@ async def feature_flow(ctx: FeatureRunCtx) -> dict[str, Any]:
 
     # 1. DRAFT - Muninn drafts the design doc, informed by the brief above.
     muninn_md = await ctx.mount_muninn_md(
-        "🐦‍⬛  **Muninn · step 2/4 · drafting design doc**"
+        "🪶  **Muninn · step 2/4 · drafting design doc**"
     )
     design_prompt = ctx.feature_design_prompt.format(description=ctx.description)
     design_text, ctx.muninn_history = await run_and_stream(
@@ -510,7 +506,7 @@ async def feature_flow(ctx: FeatureRunCtx) -> dict[str, Any]:
 
         # Revise. The revised draft becomes the next round's design_text.
         revise_md = await ctx.mount_muninn_md(
-            f"🐦‍⬛  **Muninn · step 3/4 · revising design "
+            f"🪶  **Muninn · step 3/4 · revising design "
             f"(round {round_n}/{max_rounds})**"
         )
         design_text, ctx.muninn_history = await run_and_stream(
@@ -545,14 +541,14 @@ async def feature_flow(ctx: FeatureRunCtx) -> dict[str, Any]:
             "rounds": huginn_n,
         })
         await ctx.mount_muninn_md(
-            f"⚠️ Design did not converge after {huginn_n} Huginn rounds; "
+            f"🚨 Design did not converge after {huginn_n} Huginn rounds; "
             f"proceeding to implementation (freedom=high)."
         )
         verdict = "ready"  # short-circuits the while-loop below
 
     while verdict != "ready":
         await ctx.mount_muninn_md(
-            f"⚠️ **Design did not converge** after {huginn_n} Huginn rounds. "
+            f"🚨 **Design did not converge** after {huginn_n} Huginn rounds. "
             f"Asking how you want to proceed."
         )
         choice = await ctx.ask_user(
@@ -604,7 +600,7 @@ async def feature_flow(ctx: FeatureRunCtx) -> dict[str, Any]:
             # is now the bundled critic + readiness output from the prior
             # round.
             revise_md = await ctx.mount_muninn_md(
-                f"🐦‍⬛  **Muninn · revising design (extra round, total {huginn_n})**"
+                f"🪶  **Muninn · revising design (extra round, total {huginn_n})**"
             )
             design_text, ctx.muninn_history = await run_and_stream(
                 ctx.muninn_agent,
@@ -638,7 +634,7 @@ async def feature_flow(ctx: FeatureRunCtx) -> dict[str, Any]:
             # it as ready (verdict flipped to "ready" by the act of resolving
             # all gaps interactively).
             answer_md = await ctx.mount_muninn_md(
-                "🐦‍⬛  **Muninn · resolving remaining gaps with user input**"
+                "🪶  **Muninn · resolving remaining gaps with user input**"
             )
             answer_prompt = (
                 "Huginn's most recent critique listed numbered gaps. The user "
@@ -674,7 +670,7 @@ async def feature_flow(ctx: FeatureRunCtx) -> dict[str, Any]:
 
     # 4. Muninn implements via tool calls.
     impl_md = await ctx.mount_muninn_md(
-        "🐦‍⬛ **Muninn · step 4/4 · implementing**"
+        "🪶 **Muninn · step 4/4 · implementing**"
     )
     impl_prompt = (
         "Now implement the design above, grounded in the CONTEXT BRIEF you produced earlier.\n"
@@ -774,7 +770,7 @@ async def bug_flow(ctx: BugRunCtx) -> dict[str, Any]:
 
     # Step 1/5: Ground the bug area.
     ground_md = await ctx.mount_muninn_md(
-        "🐦‍⬛ **Muninn · step 1/5 · grounding the bug area**"
+        "🪶 **Muninn · step 1/5 · grounding the bug area**"
     )
     ground_prompt = ctx.bug_ground_prompt.format(description=ctx.description)
     ground_text, ctx.muninn_history = await run_and_stream(
@@ -790,7 +786,7 @@ async def bug_flow(ctx: BugRunCtx) -> dict[str, Any]:
 
     # Step 2/5: Problem doc.
     problem_md = await ctx.mount_muninn_md(
-        "🐦‍⬛  **Muninn · step 2/5 · writing problem doc**"
+        "🪶  **Muninn · step 2/5 · writing problem doc**"
     )
     problem_prompt = ctx.bug_problem_prompt.format(description=ctx.description)
     problem_text, ctx.muninn_history = await run_and_stream(
@@ -830,7 +826,7 @@ async def bug_flow(ctx: BugRunCtx) -> dict[str, Any]:
             break
 
         revise_md = await ctx.mount_muninn_md(
-            f"🐦‍⬛  **Muninn · step 3/5 · revising problem doc "
+            f"🪶  **Muninn · step 3/5 · revising problem doc "
             f"(round {round_n}/{max_rounds})**"
         )
         problem_text, ctx.muninn_history = await run_and_stream(
@@ -856,14 +852,14 @@ async def bug_flow(ctx: BugRunCtx) -> dict[str, Any]:
             "rounds": huginn_n,
         })
         await ctx.mount_muninn_md(
-            f"⚠️ Diagnosis did not converge after {huginn_n} Huginn rounds; "
+            f"🚨 Diagnosis did not converge after {huginn_n} Huginn rounds; "
             f"proceeding to failing test + fix (freedom=high)."
         )
         verdict = "ready"
 
     while verdict != "ready":
         await ctx.mount_muninn_md(
-            f"⚠️ **Diagnosis did not converge** after {huginn_n} Huginn rounds. "
+            f"🚨 **Diagnosis did not converge** after {huginn_n} Huginn rounds. "
             f"Asking how you want to proceed."
         )
         choice = await ctx.ask_user(
@@ -910,7 +906,7 @@ async def bug_flow(ctx: BugRunCtx) -> dict[str, Any]:
         if choice.startswith("do one more"):
             huginn_n += 1
             revise_md = await ctx.mount_muninn_md(
-                f"🐦‍⬛  **Muninn · revising problem doc "
+                f"🪶  **Muninn · revising problem doc "
                 f"(extra round, total {huginn_n})**"
             )
             problem_text, ctx.muninn_history = await run_and_stream(
@@ -937,7 +933,7 @@ async def bug_flow(ctx: BugRunCtx) -> dict[str, Any]:
             continue
         if choice.startswith("let me answer"):
             answer_md = await ctx.mount_muninn_md(
-                "🐦‍⬛  **Muninn · resolving remaining gaps with user input**"
+                "🪶  **Muninn · resolving remaining gaps with user input**"
             )
             answer_prompt = (
                 "Huginn's most recent critique listed numbered gaps in the "
@@ -975,7 +971,7 @@ async def bug_flow(ctx: BugRunCtx) -> dict[str, Any]:
     #           on the current code. The test exists BEFORE the fix so the
     #           reproduction is captured as code, not just prose.
     test_md = await ctx.mount_muninn_md(
-        "🐦‍⬛  **Muninn · step 4/5 · writing failing test**"
+        "🪶  **Muninn · step 4/5 · writing failing test**"
     )
     test_prompt = (
         "Now write a REGRESSION TEST for this bug, using the PROBLEM DOC "
@@ -1016,7 +1012,7 @@ async def bug_flow(ctx: BugRunCtx) -> dict[str, Any]:
 
     # Step 5/5: Fix.
     fix_md = await ctx.mount_muninn_md(
-        "🐦‍⬛  **Muninn · step 5/5 · fixing**"
+        "🪶  **Muninn · step 5/5 · fixing**"
     )
     fix_prompt = (
         "Now FIX the bug.\n"
@@ -1277,7 +1273,7 @@ async def _fan_out_lenses(
     # Step 1: sequential mount + factory in tuple order.
     prepared: list[tuple[str, Any, Agent, str]] = []
     for lens in lens_order:
-        header = f"👁️  **Huginn · {lens} lens · thinking…**"
+        header = f"👀  **Huginn · {lens} lens · thinking…**"
         md = await mount_huginn_md(header)
         agent = huginn_agent_factory()
         prompt = lens_prompts[lens]
@@ -1405,7 +1401,7 @@ async def brainstorm_flow(ctx: BrainstormRunCtx) -> dict[str, Any]:
 
     # Step 1: Ground.
     ground_md = await ctx.mount_muninn_md(
-        "🐦‍⬛ **Muninn · step 1/4 · grounding the idea space**"
+        "🪶 **Muninn · step 1/4 · grounding the idea space**"
     )
     ground_prompt = ctx.brainstorm_ground_prompt.format(description=ctx.description)
     ground_text, ctx.muninn_history = await run_and_stream(
@@ -1421,7 +1417,7 @@ async def brainstorm_flow(ctx: BrainstormRunCtx) -> dict[str, Any]:
 
     # Step 2: Fan out 3 lenses in parallel.
     await ctx.mount_muninn_md(
-        "🐦‍⬛ **Muninn · step 2/4 · fanning out 3 Huginn lenses**"
+        "🪶 **Muninn · step 2/4 · fanning out 3 Huginn lenses**"
     )
     lens_prompts = {
         lens: ctx.brainstorm_lens_prompts[lens].format(
@@ -1460,7 +1456,7 @@ async def brainstorm_flow(ctx: BrainstormRunCtx) -> dict[str, Any]:
 
     # Step 3: Synthesize.
     syn_md = await ctx.mount_muninn_md(
-        f"🐦‍⬛ **Muninn · step 3/4 · synthesizing "
+        f"🪶 **Muninn · step 3/4 · synthesizing "
         f"{len(lens_results)} lens(es)**"
     )
     ctx.log({"type": "brainstorm_synthesizing",
@@ -1496,7 +1492,7 @@ async def brainstorm_flow(ctx: BrainstormRunCtx) -> dict[str, Any]:
                  "exc": synthesis_failed, "msg": str(exc)})
 
     # Step 4: Save artifact.
-    await ctx.mount_muninn_md("🐦‍⬛ **Muninn · step 4/4 · saving artifact**")
+    await ctx.mount_muninn_md("🪶 **Muninn · step 4/4 · saving artifact**")
     slug = _slug_for_path(ctx.description)
     path = _unique_artifact_path(ctx.cwd, "brainstorms", slug)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1526,7 +1522,7 @@ async def brainstorm_flow(ctx: BrainstormRunCtx) -> dict[str, Any]:
     if synthesis_failed:
         summary["synthesis_failed"] = synthesis_failed
         await ctx.mount_muninn_md(
-            f"⚠️ **/brainstorm partial** · synthesis failed "
+            f"🚨 **/brainstorm partial** · synthesis failed "
             f"({synthesis_failed}); lens outputs saved to {rel}"
         )
     else:
@@ -1558,7 +1554,7 @@ async def prd_flow(ctx: PRDRunCtx) -> dict[str, Any]:
 
     # Step 1: Ground.
     ground_md = await ctx.mount_muninn_md(
-        "🐦‍⬛ **Muninn · step 1/5 · grounding (codebase landmarks)**"
+        "🪶 **Muninn · step 1/5 · grounding (codebase landmarks)**"
     )
     ground_prompt = ctx.prd_ground_prompt.format(description=ctx.description)
     ground_text, ctx.muninn_history = await run_and_stream(
@@ -1574,7 +1570,7 @@ async def prd_flow(ctx: PRDRunCtx) -> dict[str, Any]:
 
     # Step 2: Single Muninn QA turn (3-5 ask_user calls + summary block).
     qa_md = await ctx.mount_muninn_md(
-        "🐦‍⬛ **Muninn · step 2/5 · structured Q&A (3-5 gaps)**"
+        "🪶 **Muninn · step 2/5 · structured Q&A (3-5 gaps)**"
     )
     ctx.log({"type": "prd_qa_started"})
     qa_prompt = ctx.prd_qa_prompt.format(
@@ -1607,7 +1603,7 @@ async def prd_flow(ctx: PRDRunCtx) -> dict[str, Any]:
 
     # Step 3: Fan out 3 research lenses in parallel.
     await ctx.mount_muninn_md(
-        "🐦‍⬛ **Muninn · step 3/5 · fanning out 3 research lenses**"
+        "🪶 **Muninn · step 3/5 · fanning out 3 research lenses**"
     )
     lens_prompts = {
         lens: ctx.prd_lens_prompts[lens].format(
@@ -1645,7 +1641,7 @@ async def prd_flow(ctx: PRDRunCtx) -> dict[str, Any]:
 
     # Step 4: Synthesize the PRD.
     syn_md = await ctx.mount_muninn_md(
-        f"🐦‍⬛ **Muninn · step 4/5 · synthesizing PRD "
+        f"🪶 **Muninn · step 4/5 · synthesizing PRD "
         f"({len(lens_results)} lens(es))**"
     )
     ctx.log({"type": "prd_synthesizing",
@@ -1682,7 +1678,7 @@ async def prd_flow(ctx: PRDRunCtx) -> dict[str, Any]:
                  "exc": synthesis_failed, "msg": str(exc)})
 
     # Step 5: Save artifact.
-    await ctx.mount_muninn_md("🐦‍⬛ **Muninn · step 5/5 · saving artifact**")
+    await ctx.mount_muninn_md("🪶 **Muninn · step 5/5 · saving artifact**")
     slug = _slug_for_path(ctx.description)
     path = _unique_artifact_path(ctx.cwd, "prds", slug)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1713,7 +1709,7 @@ async def prd_flow(ctx: PRDRunCtx) -> dict[str, Any]:
     if synthesis_failed:
         summary["synthesis_failed"] = synthesis_failed
         await ctx.mount_muninn_md(
-            f"⚠️ **/prd partial** · synthesis failed "
+            f"🚨 **/prd partial** · synthesis failed "
             f"({synthesis_failed}); lens outputs saved to {rel}"
         )
     else:
@@ -1928,7 +1924,7 @@ async def precommit_review_flow(ctx: ReviewRunCtx) -> dict[str, Any]:
     await ctx.mount_muninn_md("### 🔍 `/precommit-review`")
 
     # Step 1: gather diff.
-    await ctx.mount_muninn_md("🐦‍⬛  **Muninn · gathering diff**")
+    await ctx.mount_muninn_md("🪶  **Muninn · gathering diff**")
     diff_text, diff_err = await _gather_diff(ctx.cwd)
     if diff_err:
         await ctx.mount_muninn_md(
@@ -1954,7 +1950,7 @@ async def precommit_review_flow(ctx: ReviewRunCtx) -> dict[str, Any]:
     changed = await _changed_files(ctx.cwd)
 
     await ctx.mount_muninn_md(
-        f"🐦‍⬛  **Muninn · running local checks** (stack: {stack.name})"
+        f"🪶  **Muninn · running local checks** (stack: {stack.name})"
     )
     checks: list[dict[str, Any]] = []
     for spec in stack.checks:
@@ -1987,7 +1983,7 @@ async def precommit_review_flow(ctx: ReviewRunCtx) -> dict[str, Any]:
 
     # Step 3: Huginn cold-read.
     huginn_md = await ctx.mount_huginn_md(
-        "👁️  **Huginn · cold-reading the diff**"
+        "👀  **Huginn · cold-reading the diff**"
     )
     huginn = ctx.huginn_agent_factory()
     review_prompt = ctx.review_prompt.format(
@@ -2006,7 +2002,7 @@ async def precommit_review_flow(ctx: ReviewRunCtx) -> dict[str, Any]:
 
     no_findings = _has_no_findings(review_text)
     callout = "✅ no findings" if no_findings else "❌ findings flagged"
-    await ctx.mount_huginn_md(f"👁️  **Huginn says:** {callout}")
+    await ctx.mount_huginn_md(f"👀  **Huginn says:** {callout}")
     ctx.log({
         "type": "review_verdict",
         "no_findings": no_findings,
