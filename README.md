@@ -1,4 +1,4 @@
-# 🐦‍⬛ Muninn CLI
+# 🪶 Muninn CLI
 
 <img width="1004" height="674" alt="mununn_cli" src="https://github.com/user-attachments/assets/7cbacd9f-0b1d-4950-b366-0aef2178209a" />
 

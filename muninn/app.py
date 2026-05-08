@@ -363,7 +363,7 @@ class MuninnTUI(App):
         yield Static("⏳ Booting...", id="status-banner")
         with Horizontal(id="panes"):
             with Vertical(id="muninn-pane"):
-                yield Static("🐦‍⬛  [b]Muninn (memory)[/b]", id="muninn-header")
+                yield Static("🪶  [b]Muninn (memory)[/b]", id="muninn-header")
                 yield VerticalScroll(id="muninn-scroll")
                 yield Input(
                     placeholder=(
@@ -382,7 +382,7 @@ class MuninnTUI(App):
                     candidates=_slash_candidates,
                 )
             with Vertical(id="huginn-pane"):
-                yield Static("👁️  [b]Huginn (cold-read)[/b]", id="huginn-header")
+                yield Static("👀  [b]Huginn (cold-read)[/b]", id="huginn-header")
                 yield VerticalScroll(id="huginn-scroll")
         # F12 debug pane: hidden by default, overlays the right pane on toggle.
         # Receives every record passed to self._log so the user can watch the
@@ -549,7 +549,7 @@ class MuninnTUI(App):
                 self.health_status = HEALTH_MODEL_MISSING
                 self.health_detail = wanted
                 self._set_banner(
-                    f"⚠️ Ollama up but model {wanted!r} not pulled.  ·  Ctrl+R to retry",
+                    f"🚨 Ollama up but model {wanted!r} not pulled.  ·  Ctrl+R to retry",
                     "status-warn",
                 )
                 # Offer to pull it once per session.
@@ -677,7 +677,7 @@ class MuninnTUI(App):
         """Build the green-banner text. Includes the runtime-tweakable settings
         so the user can see current values without opening the palette."""
         return (
-            f"🐦‍⬛ Ollama OK · {self.health_detail} · "
+            f"🪶 Ollama OK · {self.health_detail} · "
             f"freedom: {self.freedom_level} · "
             f"num_ctx: {self.config.get('num_ctx', '?')} · "
             f"revisions: {self.config.get('max_revision_rounds', '?')}"
@@ -957,7 +957,7 @@ class MuninnTUI(App):
     @work(group="muninn", exclusive=False)
     async def _run_chat_worker(self, text: str) -> None:
         md = await self._new_streaming_md(
-            "🐦‍⬛ **Muninn · working solo…**", pane="muninn"
+            "🪶 **Muninn · working solo…**", pane="muninn"
         )
         completed_cleanly = False
         try:
